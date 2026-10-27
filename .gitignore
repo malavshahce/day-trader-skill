@@ -1,0 +1,6 @@
+# runtime state and anything personal
+trader/
+.env
+*.key
+.DS_Store
+__pycache__/
