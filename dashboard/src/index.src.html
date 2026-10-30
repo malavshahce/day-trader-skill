@@ -193,7 +193,7 @@ input:invalid, input.bad { border-color: var(--bad); }
     journal: [], store: "local", dbNote: "", settingsErr: "",
     drawer: null, ctxSym: null, chat: [], chatBusy: false, chatCtl: null, chatNote: "", sampleOK: null
   };
-  var db = null, sample = null, unsubs = [], writeQ = Promise.resolve();
+  var db = null, sample = null, unsubs = [], writeQ = Promise.resolve(), base = null, jcoll = null;
 
   /* ---------------- helpers ---------------- */
   function $(s, r) { return (r || document).querySelector(s); }
@@ -255,21 +255,21 @@ input:invalid, input.bad { border-color: var(--bad); }
     lsSet("td.cfg", JSON.stringify(S.cfg));
     if (!db) return;
     clearTimeout(cfgTimer);
-    cfgTimer = setTimeout(function () { queue(function () { return db.doc("settings/main").set(Object.assign({}, S.cfg)); }); }, 600);
+    cfgTimer = setTimeout(function () { cfgTimer = null; queue(function () { return db.doc(base).set({ cfg: Object.assign({}, S.cfg) }); }); }, 600);
   }
   function jAdd(e) {
     e.created = new Date().toISOString();
-    if (db) return queue(function () { return db.collection("journal").add(e); });
+    if (db) return queue(function () { return jcoll.add(e); });
     e.id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     S.journal.unshift(e); lsSet("td.journal", JSON.stringify(S.journal)); return Promise.resolve();
   }
   function jUpdate(id, patch) {
-    if (db) return queue(function () { return db.doc("journal/" + id).update(patch); });
+    if (db) return queue(function () { return jcoll.doc(id).update(patch); });
     S.journal = S.journal.map(function (x) { return x.id === id ? Object.assign({}, x, patch) : x; });
     lsSet("td.journal", JSON.stringify(S.journal)); return Promise.resolve();
   }
   function jDelete(id) {
-    if (db) return queue(function () { return db.doc("journal/" + id).delete(); });
+    if (db) return queue(function () { return jcoll.doc(id).delete(); });
     S.journal = S.journal.filter(function (x) { return x.id !== id; });
     lsSet("td.journal", JSON.stringify(S.journal)); return Promise.resolve();
   }
@@ -524,7 +524,7 @@ input:invalid, input.bad { border-color: var(--bad); }
     var ts = todayStats(), js = S.journal, closed = js.filter(function (j) { return j.exit !== null && j.exit !== undefined && j.exit !== ""; });
     var pnl = 0, wins = 0, rs = 0;
     closed.forEach(function (j) { var q = L.num(j.qty), d = (L.num(j.exit) - L.num(j.entry)) * q, risk = (L.num(j.entry) - L.num(j.stop)) * q; pnl += d; if (d > 0) wins++; if (risk > 0) rs += d / risk; });
-    var h = '<section class="card"><div class="head"><h2>Journal</h2><span class="src">' + (db ? "Saved to your artifact, shared across devices" : "Saved in this browser only") + "</span></div>";
+    var h = '<section class="card"><div class="head"><h2>Journal</h2><span class="src">' + (db ? "Private to you, synced across your devices" : "Saved in this browser only") + "</span></div>";
     if (S.dbNote) h += '<div class="note bad" style="margin-bottom:10px">' + esc(S.dbNote) + "</div>";
     h += '<div class="tiles"><div class="tile"><div class="k">Today</div><div class="v">' + ts.trades + ' / ' + esc(S.cfg.max_trades_per_day) + '</div><div class="d muted">trades</div></div><div class="tile"><div class="k">Risked today</div><div class="v">' + L.money(ts.risked, 0) + '</div><div class="d muted">of ' + L.money(L.num(S.cfg.max_daily_loss_usd), 0) + "</div></div><div class=\"tile\"><div class=\"k\">Closed P&amp;L</div><div class=\"v " + cls(pnl) + '">' + L.money(pnl) + '</div><div class="d muted">' + closed.length + " trades</div></div><div class=\"tile\"><div class=\"k\">Win rate</div><div class=\"v\">" + (closed.length ? Math.round(wins / closed.length * 100) + "%" : "–") + '</div><div class="d muted">' + (closed.length ? (rs / closed.length).toFixed(2) + " avg R" : "no closed trades") + "</div></div></div></section>";
     h += '<section class="card"><h3>Add a trade</h3><div class="form" style="margin-top:10px"><label class="f">Symbol<input id="j-sym" maxlength="8" autocomplete="off"></label>' + pin("j-entry", "Entry ($)", "") + pin("j-stop", "Stop ($)", "") + pin("j-target", "Target ($)", "") + pin("j-qty", "Shares", "") + pin("j-exit", "Exit ($, if closed)", "") + '<label class="f wide">Note<input id="j-note" maxlength="200" autocomplete="off" placeholder="why you took it"></label></div><div class="err" id="j-err"></div><button class="btn p" data-act="jadd">Add to journal</button></section>';
@@ -537,7 +537,7 @@ input:invalid, input.bad { border-color: var(--bad); }
 
   /* ---------------- Settings ---------------- */
   function vSettings() {
-    var h = '<section class="card"><div class="head"><h2>Settings</h2><span class="src">' + (db ? "Shared across your devices" : "This browser only") + "</span></div>";
+    var h = '<section class="card"><div class="head"><h2>Settings</h2><span class="src">' + (db ? "Private to you, synced across your devices" : "This browser only") + "</span></div>";
     h += '<p class="muted" style="margin-bottom:12px">These mirror <span class="mono">trader/config.json</span> in your workspace. They drive sizing and the risk check here. Changes save automatically.</p>';
     h += '<div class="form">' + CFG_FIELDS.map(function (f) {
       return '<label class="f">' + esc(f[1]) + '<input id="s-' + f[0] + '" ' + (f[2] === "time" ? 'type="time"' : 'class="num" inputmode="decimal"') + ' value="' + esc(S.cfg[f[0]]) + '"></label>';
@@ -693,22 +693,30 @@ input:invalid, input.bad { border-color: var(--bad); }
   }
   async function connect() {
     var cl = window.claude; if (!cl || typeof cl.use !== "function") { S.sampleOK = false; return; }
+    var user = null, uid = null;
     try { db = await cl.use("db"); } catch (e) { db = null; }
+    try { user = await cl.use("user"); uid = user ? await user.id() : null; } catch (e) { uid = null; }
     try { sample = await cl.use("sample"); } catch (e) { sample = null; }
     S.sampleOK = !!sample;
     if (S.tab === "ask") updateChat();
     if (!db) return;
+    if (!uid) { db = null; S.dbNote = "Could not identify your account, so settings and journal stay in this browser."; renderIfTab(["settings", "journal"]); return; }
+    var canW = null; try { canW = user && typeof user.can === "function" ? user.can("data.write") : null; } catch (e) { canW = null; }
+    if (canW === false) { db = null; S.dbNote = "You have view-only access, so your settings and journal are saved in this browser only. Ask the owner for Contributor access to sync them."; renderIfTab(["settings", "journal"]); return; }
     S.store = "db"; S.dbNote = "";
     try {
-      unsubs.push(db.doc("settings/main").onSnapshot(function (snap) {
-        if (snap.exists && !cfgTimer) { S.cfg = cfgClean(snap.data()); lsSet("td.cfg", JSON.stringify(S.cfg)); renderIfTab(["settings", "planner", "today", "scanner"]); }
-        else if (!snap.exists) renderIfTab(["settings"]);
+      base = "data/users/" + uid + "/profile";
+      var prof = db.doc(base); jcoll = prof.collection("journal");
+      unsubs.push(prof.onSnapshot(function (snap) {
+        var d = snap.exists ? snap.data() : null;
+        if (d && d.cfg && !cfgTimer) { S.cfg = cfgClean(d.cfg); lsSet("td.cfg", JSON.stringify(S.cfg)); renderIfTab(["settings", "planner", "today", "scanner"]); }
+        else renderIfTab(["settings"]);
       }, function (e) { S.dbNote = "Settings sync stopped (" + (e && e.code) + ")."; }));
-      unsubs.push(db.collection("journal").orderBy("created", "desc").limit(300).onSnapshot(function (snap) {
+      unsubs.push(jcoll.orderBy("created", "desc").limit(300).onSnapshot(function (snap) {
         S.journal = snap.docs.map(function (d) { return Object.assign({ id: d.id }, d.data()); });
         renderIfTab(["journal", "planner"]);
       }, function (e) { S.dbNote = "Journal sync stopped (" + (e && e.code) + ")."; renderIfTab(["journal"]); }));
-    } catch (e) { S.dbNote = "Shared storage unavailable. Using this browser."; db = null; }
+    } catch (e) { S.dbNote = "Private storage unavailable. Using this browser."; db = null; }
     if (S.tab === "settings" || S.tab === "journal") renderIfTab([S.tab]);
   }
 

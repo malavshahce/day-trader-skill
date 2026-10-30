@@ -23,6 +23,7 @@ const MOCK = (mode) => `(() => {
     set: async (d) => { store.set(p, JSON.parse(JSON.stringify(d))); notify(); },
     update: async (d) => { if (!store.has(p)) throw {code:"invalid_argument",message:"missing"}; store.set(p, Object.assign({}, store.get(p), d)); notify(); },
     delete: async () => { store.delete(p); notify(); },
+    collection: (n) => coll(p + "/" + n),
     onSnapshot: (next) => { const f = () => next(snapDoc(p.split("/").pop(), store.get(p))); listeners.push(f); setTimeout(f, 0); return () => {}; } });
   const coll = (c, ord, lim) => ({
     path: c,
@@ -46,7 +47,8 @@ const MOCK = (mode) => `(() => {
     }
     opts.onText({ text: full, delta: "" }); return { text: full, truncated: false };
   };
-  window.claude = { use: async (n) => n === "db" ? (mode === "nodb" ? null : { doc, collection: (c) => coll(c) }) : n === "sample" ? (mode === "nosample" ? null : sample) : null };
+  const user = { id: async () => window.__uid || "u_test", can: () => mode === "viewonly" ? false : true, isOwner: () => true, canEdit: () => true };
+  window.claude = { use: async (n) => n === "user" ? user : n === "db" ? (mode === "nodb" ? null : { doc, collection: (c) => coll(c) }) : n === "sample" ? (mode === "nosample" ? null : sample) : null };
 })();`;
 
 let failures = 0;
@@ -142,8 +144,9 @@ function check(name, cond, extra) { if (cond) console.log("ok   " + name); else 
   await p.select("#p-targetRule", "r"); await type(p, "#p-targetParam", "2");
   // log to journal
   await click(p, '[data-act=logplan]'); await new Promise(r => setTimeout(r, 150));
-  const logged = await p.evaluate(() => [...window.__store.keys()].filter(k => k.startsWith("journal/")).length);
-  check("log plan writes a journal doc to db", logged === 1, logged + "");
+  const logged = await p.evaluate(() => [...window.__store.keys()].filter(k => k.startsWith("data/users/u_test/profile/journal/")).length);
+  check("log plan writes a journal doc under the viewer's private path", logged === 1, logged + "");
+  check("nothing written to shared paths", await p.evaluate(() => [...window.__store.keys()].every(k => k.startsWith("data/users/u_test/"))));
   await tab(p, "journal");
   check("journal shows logged trade", /TSLA/.test(await text(p, "#view")) && /1 \/ 3/.test(await text(p, "#view")));
   // add trade
@@ -182,7 +185,7 @@ function check(name, cond, extra) { if (cond) console.log("ok   " + name); else 
   await tab(p, "settings");
   await type(p, "#s-max_loss_per_trade_usd", "20");
   await new Promise(r => setTimeout(r, 900));
-  check("settings saved to db after debounce", await p.evaluate(() => window.__store.get("settings/main") && window.__store.get("settings/main").max_loss_per_trade_usd === 20));
+  check("settings saved to db after debounce", await p.evaluate(() => window.__store.get("data/users/u_test/profile") && window.__store.get("data/users/u_test/profile").cfg.max_loss_per_trade_usd === 20));
   await type(p, "#s-max_loss_per_trade_usd", "abc");
   check("settings invalid shows error", /valid number/.test(await text(p, "#s-err")) && await p.$eval("#s-max_loss_per_trade_usd", e => e.classList.contains("bad")));
   await type(p, "#s-max_loss_per_trade_usd", "20");
@@ -241,6 +244,29 @@ function check(name, cond, extra) { if (cond) console.log("ok   " + name); else 
   await click(p, "#a-stop"); await new Promise(r => setTimeout(r, 600));
   check("stop cancels and restores Ask button", (await p.$eval("#a-stop", e => e.hidden)) && !(await p.$eval("#a-send", e => e.disabled)) && !/Thinking…$/.test(await text(p, "#chat")));
   await p.close();
+
+  /* ---------- 4b. view-only viewer: no shared writes, local fallback with explanation ---------- */
+  p = await open("viewonly"); await tab(p, "journal"); await new Promise(r => setTimeout(r, 200));
+  check("view-only: explains and uses this browser", /view-only access/.test(await text(p, "#view")) && /this browser only/i.test(await text(p, "#view")));
+  await type(p, "#j-sym", "vvv"); await type(p, "#j-entry", "10"); await type(p, "#j-stop", "9"); await type(p, "#j-qty", "2");
+  await click(p, '[data-act=jadd]'); await new Promise(r => setTimeout(r, 120));
+  check("view-only: journal still works locally and nothing hits the db", /VVV/.test(await text(p, "#view")) && (await p.evaluate(() => window.__store.size)) === 0);
+  await p.close();
+
+  /* ---------- 4c. two different people never see each other's data ---------- */
+  const shared = []; 
+  for (const uid of ["u_alice", "u_bob"]) {
+    p = await browser.newPage(); p.on("pageerror", e => shared.push("err " + e.message));
+    await p.setViewport({ width: 1280, height: 900 });
+    await p.evaluateOnNewDocument((u) => { window.__uid = u; }, uid); await p.evaluateOnNewDocument(MOCK("full"));
+    await p.goto(base, { waitUntil: "load" }); await p.waitForSelector("#view .card"); await new Promise(r => setTimeout(r, 150));
+    await tab(p, "journal"); await type(p, "#j-sym", uid === "u_alice" ? "AAA" : "BBB"); await type(p, "#j-entry", "10"); await type(p, "#j-stop", "9"); await type(p, "#j-qty", "1");
+    await click(p, '[data-act=jadd]'); await new Promise(r => setTimeout(r, 150));
+    const keys = await p.evaluate(() => [...window.__store.keys()]);
+    shared.push(uid + ":" + keys.every(k => k.startsWith("data/users/" + uid + "/")) + ":" + (/AAA|BBB/.exec(await text(p, "#view")) || [])[0]);
+    await p.close();
+  }
+  check("per-viewer paths use each person's own id", shared.join(" ") === "u_alice:true:AAA u_bob:true:BBB", shared.join(" "));
 
   /* ---------- 5. data failure ---------- */
   const bad = await browser.newPage(); await bad.setRequestInterception(true);
