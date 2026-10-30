@@ -123,10 +123,17 @@ t("csp: contracts rise with account", () => {
   const c = L.cspCalc({ price: 21.21, strike: 19.5, premium: 0.35, dte: 35, account: 50000, riskPct: 2 });
   assert.strictEqual(c.contractsByRisk, 2); assert.strictEqual(c.contracts, 2);
 });
+t("csp: 0 DTE is allowed, with no annualized rate", () => {
+  const c = L.cspCalc({ price: 10, strike: 9, premium: 0.1, dte: 0, account: 5000, riskPct: 1 });
+  assert.ok(!c.error); assert.strictEqual(c.annualizedPct, null); assert.ok(c.returnPct > 1);
+  const w = L.cspCalc({ price: 10, strike: 9, premium: 0.1, dte: 7, account: 5000, riskPct: 1 });
+  assert.ok(near(w.annualizedPct, w.returnPct * 365 / 7, 1e-9));
+});
 t("csp: errors", () => {
   assert.ok(L.cspCalc({ price: 0, strike: 1, premium: 1, dte: 1 }).error);
   assert.ok(L.cspCalc({ price: 10, strike: 9, premium: 9, dte: 10 }).error);
-  assert.ok(L.cspCalc({ price: 10, strike: 9, premium: 0.2, dte: 0 }).error);
+  assert.ok(L.cspCalc({ price: 10, strike: 9, premium: 0.2, dte: -1 }).error);
+  assert.ok(L.cspCalc({ price: 10, strike: 9, premium: 0.2, dte: "" }).error);
 });
 
 /* scan filter */

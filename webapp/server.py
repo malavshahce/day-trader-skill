@@ -25,6 +25,7 @@ import gzip
 import hashlib
 import hmac
 import http.cookiejar
+import importlib.util
 import json
 import os
 import re
@@ -48,7 +49,7 @@ DATA = Path(os.environ.get("DESK_DATA") or (Path(__file__).resolve().parent / "d
 UA = "Mozilla/5.0"  # Yahoo rejects long browser-style agents that carry no cookies
 SYM_RE = re.compile(r"^[A-Z0-9.\-^]{1,10}$")
 INDEXES = [("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq"), ("^DJI", "Dow"), ("^RUT", "Russell 2000"), ("^VIX", "VIX"), ("^VIX3M", "VIX3M")]
-EXTRA_WATCH = ["KEY", "PFE", "BAC", "F", "T"]
+EXTRA_WATCH = ["SPY", "QQQ", "AMZN", "MSFT", "META", "NVDA", "TSLA", "KEY", "PFE", "BAC", "F", "T"]   # SPY and QQQ carry the market-wide headlines
 
 _lock = threading.RLock()
 _cache = {}
@@ -177,11 +178,25 @@ def parse_batch_quote(r):
     return out
 
 
+def raw_batch(symbols):
+    """Yahoo's batch quote rows, unparsed (up to 60 symbols per call)."""
+    url = "https://query2.finance.yahoo.com/v7/finance/quote?symbols=%s&crumb={crumb}" % urllib.parse.quote(",".join(symbols))
+    return crumb_json(url)["quoteResponse"]["result"]
+
+
+def et_date_and_when(ts):
+    """Earnings timestamp -> (YYYY-MM-DD in New York, 'pre' | 'post' | '')."""
+    if not ts:
+        return None, ""
+    local = eastern_now(dt.datetime.fromtimestamp(ts, dt.timezone.utc))
+    minutes = local.hour * 60 + local.minute
+    return local.strftime("%Y-%m-%d"), ("pre" if minutes < 9 * 60 + 30 else "post" if minutes >= 16 * 60 else "")
+
+
 def fetch_quotes_batch(symbols):
     """Up to 60 symbols in ONE Yahoo call (the per-symbol chart route needs one call each)."""
-    url = "https://query2.finance.yahoo.com/v7/finance/quote?symbols=%s&crumb={crumb}" % urllib.parse.quote(",".join(symbols))
     got = {}
-    for r in crumb_json(url)["quoteResponse"]["result"]:
+    for r in raw_batch(symbols):
         try:
             got[r["symbol"]] = parse_batch_quote(r)
         except (ValueError, KeyError):
@@ -317,7 +332,8 @@ def get_earnings(extra=()):
     return {"as_of": cached_val["as_of"], "earnings": {k: {kk: vv for kk, vv in v.items() if kk != "_at"} for k, v in cached_val["earnings"].items()}}
 
 
-def fetch_chain(sym, min_dte, max_dte):
+def fetch_chain(sym, date=None):
+    """Every expiry (0 DTE out to long-dated) plus the puts for one of them. Default: the one nearest 7 days."""
     base = "https://query2.finance.yahoo.com/v7/finance/options/%s?crumb={crumb}" % urllib.parse.quote(sym)
     head = crumb_json(base)["optionChain"]["result"]
     if not head:
@@ -325,30 +341,185 @@ def fetch_chain(sym, min_dte, max_dte):
     head = head[0]
     price = head["quote"].get("regularMarketPrice")
     today = eastern_now().date()
-    expiries = []
+    allx = []
     for ts in head.get("expirationDates", []):
         d = dt.datetime.fromtimestamp(ts, dt.timezone.utc).date()
-        dte = (d - today).days
-        if not min_dte <= dte <= max_dte or len(expiries) >= 5:
+        if (d - today).days >= 0:
+            allx.append({"date": d.isoformat(), "dte": (d - today).days, "ts": ts})
+    if not allx:
+        raise RuntimeError("no open expiries for " + sym)
+    pick = next((x for x in allx if x["date"] == date), None) or min(allx, key=lambda x: abs(x["dte"] - 7))
+    puts = crumb_json(base + "&date=%d" % pick["ts"])["optionChain"]["result"][0]["options"][0].get("puts", [])
+    rows = []
+    for p in puts:
+        k = p.get("strike")
+        if not price or k is None or k < price * 0.5 or k > price * 1.05:
             continue
-        puts = crumb_json(base + "&date=%d" % ts)["optionChain"]["result"][0]["options"][0].get("puts", [])
+        bid, ask = p.get("bid") or 0, p.get("ask") or 0
+        mid = round((bid + ask) / 2, 3) if bid and ask else None
+        spread = round((ask - bid) / mid * 100, 1) if mid else None
+        rows.append({"k": k, "bid": bid, "ask": ask, "mid": mid, "spread": spread, "oi": p.get("openInterest") or 0,
+                     "vol": p.get("volume") or 0, "iv": round((p.get("impliedVolatility") or 0) * 100, 1)})
+    return {"symbol": sym, "price": price, "as_of": iso(time.time()), "live_quotes": any(r["bid"] and r["ask"] for r in rows),
+            "all": [{"date": x["date"], "dte": x["dte"]} for x in allx],
+            "sel": {"date": pick["date"], "dte": pick["dte"], "puts": sorted(rows, key=lambda r: -r["k"])}}
+
+
+def get_chain(sym, date=None):
+    return cached("chain:%s:%s" % (sym, date or ""), 60, lambda: fetch_chain(sym, date))
+
+
+# ------------------------------------------------------------------ movers (pre-market, after-hours, intraday)
+
+liquid_state = {"running": False}
+
+
+def build_liquid():
+    """Which of the ~5,900 listed stocks trade enough to matter ($5+, 1M+ average shares). Runs about once a day."""
+    with _lock:
+        if liquid_state["running"]:
+            return
+        liquid_state["running"] = True
+    try:
+        uni = DATA / "trader" / "universe.txt"
+        if not uni.exists():
+            subprocess.run([sys.executable, str(SKILLS / "trader-scanner" / "scan.py"), "universe"], cwd=str(DATA), check=True, capture_output=True, timeout=180)
+        syms = [l.split("|")[0] for l in uni.read_text().splitlines() if l.strip()]
+        chunks = [syms[i:i + 60] for i in range(0, len(syms), 60)]
+
+        def one(chunk):
+            try:
+                return raw_batch(chunk)
+            except Exception:
+                return []
+        keep, names = [], {}
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for rows in ex.map(one, chunks):
+                for r in rows:
+                    if (r.get("regularMarketPrice") or 0) >= 5 and (r.get("averageDailyVolume3Month") or 0) >= 1_000_000:
+                        keep.append(r["symbol"])
+                        names[r["symbol"]] = r.get("shortName") or ""
+        if len(keep) > 200:
+            write_json(DATA / "liquid.json", {"at": iso(time.time()), "symbols": keep, "names": names})
+    except Exception as e:
+        sys.stderr.write("liquid build failed: %s\n" % e)
+    finally:
+        liquid_state["running"] = False
+
+
+def mover_row(r, names):
+    reg_t = r.get("regularMarketTime") or 0
+    cands = [(r.get(tk), r.get(pk), ses) for pk, tk, ses in (("preMarketPrice", "preMarketTime", "pre"), ("postMarketPrice", "postMarketTime", "post"))
+             if r.get(pk) is not None and (r.get(tk) or 0) > reg_t]
+    reg = r.get("regularMarketPrice")
+    if not reg:
+        return None
+    day = r.get("regularMarketChangePercent")
+    if cands:
+        t, p, ses = max(cands)
+        move = (p / reg - 1) * 100            # reaction since the regular-session close
+    else:
+        p, ses, t = reg, "reg", reg_t
+        move = day or 0.0
+    e_date, e_when = et_date_and_when(r.get("earningsTimestamp"))
+    return {"s": r["symbol"], "n": names.get(r["symbol"]) or r.get("shortName") or "", "close": round(reg, 2), "p": round(p, 2), "ses": ses,
+            "move": round(move, 2), "day": round(day, 2) if day is not None else None, "e": e_date, "ew": e_when,
+            "vol": r.get("regularMarketVolume") or 0, "t": iso(t) if t else None}
+
+
+def get_movers():
+    liquid = read_json(DATA / "liquid.json")
+    fresh = False
+    if liquid:
+        try:
+            fresh = time.time() - (DATA / "liquid.json").stat().st_mtime < 20 * 3600
+        except OSError:
+            pass
+    if not fresh and not liquid_state["running"]:
+        threading.Thread(target=build_liquid, daemon=True).start()
+    if not liquid:
+        return {"building": True, "rows": [], "as_of": iso(time.time())}
+    names = liquid.get("names", {})
+
+    def build():
+        syms = liquid["symbols"]
+        chunks = [syms[i:i + 60] for i in range(0, len(syms), 60)]
+
+        def one(chunk):
+            try:
+                return raw_batch(chunk)
+            except Exception:
+                return []
         rows = []
-        for p in puts:
-            k = p.get("strike")
-            if not price or k is None or k < price * 0.6 or k > price * 1.02:
-                continue
-            bid, ask = p.get("bid") or 0, p.get("ask") or 0
-            mid = round((bid + ask) / 2, 3) if bid and ask else None
-            spread = round((ask - bid) / mid * 100, 1) if mid else None
-            rows.append({"k": k, "bid": bid, "ask": ask, "mid": mid, "spread": spread, "oi": p.get("openInterest") or 0,
-                         "vol": p.get("volume") or 0, "iv": round((p.get("impliedVolatility") or 0) * 100, 1)})
-        expiries.append({"date": d.isoformat(), "dte": dte, "puts": sorted(rows, key=lambda r: -r["k"])})
-    quotes_live = any(r["bid"] and r["ask"] for e in expiries for r in e["puts"])
-    return {"symbol": sym, "price": price, "as_of": iso(time.time()), "expiries": expiries, "live_quotes": quotes_live}
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for part in ex.map(one, chunks):
+                for r in part:
+                    m = mover_row(r, names)
+                    if m and abs(m["move"]) >= 2.0:
+                        rows.append(m)
+        rows.sort(key=lambda x: -abs(x["move"]))
+        return {"building": False, "as_of": iso(time.time()), "checked": len(syms), "rows": rows[:100]}
+    return cached("movers", 240, build)
 
 
-def get_chain(sym, min_dte=14, max_dte=60):
-    return cached("chain:%s:%d:%d" % (sym, min_dte, max_dte), 60, lambda: fetch_chain(sym, min_dte, max_dte))
+# ------------------------------------------------------------------ look up any stock
+
+_scan_mod = []
+
+
+def scanner_module():
+    if not _scan_mod:
+        spec = importlib.util.spec_from_file_location("trader_scan", str(SKILLS / "trader-scanner" / "scan.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        _scan_mod.append(m)
+    return _scan_mod[0]
+
+
+def explain_setups(closes, nums, tags):
+    last = closes[-1]
+    notes = []
+    gap = (nums["high20"] / last - 1) * 100
+    notes.append(("breakout_20d", "breakout_20d" in tags,
+                  "Closed above its 20-day closing high (%.2f)." % nums["high20"] if "breakout_20d" in tags else
+                  "Closed at %.2f, %.1f%% below its 20-day closing high of %.2f. A breakout needs a close above it." % (last, gap, nums["high20"])))
+    notes.append(("reclaim_ma20", "reclaim_ma20" in tags,
+                  "Moved back above its 20-day average (%.2f) after closing below it." % nums["ma20"] if "reclaim_ma20" in tags else
+                  "%s its 20-day average (%.2f), with no cross from below on the last close." % ("Above" if last > nums["ma20"] else "Below", nums["ma20"])))
+    notes.append(("bull_flag", "bull_flag" in tags,
+                  "Ran %.0f%% in the last 10 days and has traded in a tight %.1f%% range for 5 days." % (nums["run_pct"], nums["range5_pct"]) if "bull_flag" in tags else
+                  "Ran %.0f%% over the last 10 days with a %.1f%% five-day range. A flag needs more than 10%% and under 5%%." % (nums["run_pct"], nums["range5_pct"])))
+    r = nums["rsi"]
+    notes.append(("oversold", "oversold" in tags, "RSI is %.0f, under 30." % r if "oversold" in tags else "RSI is %.0f. Oversold means under 30." % r))
+    notes.append(("oversold_bounce", "oversold_bounce" in tags,
+                  "RSI was under 30 yesterday and the stock closed up." if "oversold_bounce" in tags else "No bounce: RSI was not under 30 on the prior day."))
+    return [{"k": k, "match": m, "why": w} for k, m, w in notes]
+
+
+def lookup(sym):
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=6mo&interval=1d" % urllib.parse.quote(sym)
+    res = http_json(url)["chart"]["result"][0]
+    meta = res.get("meta", {})
+    pairs = [(t, c) for t, c in zip(res.get("timestamp") or [], res["indicators"]["quote"][0]["close"]) if c is not None]
+    now = eastern_now()
+    if pairs and eastern_now(dt.datetime.fromtimestamp(pairs[-1][0], dt.timezone.utc)).date() == now.date() and now.time() < dt.time(16, 0):
+        pairs = pairs[:-1]                                   # today's bar is still forming
+    closes = [float(c) for _, c in pairs]
+    if len(closes) < 30:
+        raise RuntimeError("not enough history")
+    tags, nums = scanner_module().find_setups(closes)
+    out = {"symbol": sym, "name": meta.get("longName") or meta.get("shortName") or "", "close": round(closes[-1], 2), "rsi": round(nums["rsi"], 1),
+           "high20": round(nums["high20"], 2), "ma20": round(nums["ma20"], 2), "setups": tags, "checks": explain_setups(closes, nums, tags),
+           "as_of": dt.datetime.fromtimestamp(pairs[-1][0], dt.timezone.utc).strftime("%Y-%m-%d")}
+    try:
+        out["earn"] = (fetch_earnings([sym]).get(sym) or {}).get("earn")
+    except Exception:
+        out["earn"] = None
+    return out
+
+
+def get_lookup(sym):
+    return cached("lookup:" + sym, 120, lambda: lookup(sym))
 
 
 # ------------------------------------------------------------------ files, scan, news
@@ -454,16 +625,18 @@ def refresh_news():
     return out
 
 
-def get_news():
-    """Return the saved news at once; refresh it in the background when it is older than 10 minutes."""
+def get_news(force=False):
+    """Return the saved news at once; refresh it in the background when it is older than 5 minutes (or when asked, at most once a minute)."""
     news = read_json(DATA / "news.json", {"checked": None, "items": [], "moves": {}})
-    stale = True
+    age = 1e9
     try:
-        stale = time.time() - (DATA / "news.json").stat().st_mtime > 600
+        age = time.time() - (DATA / "news.json").stat().st_mtime
     except OSError:
         pass
+    stale = age > 300 or (force and age > 60)
     with _lock:
         busy = _cache.get("news-bg")
+        news["refreshing"] = bool(busy) or stale
         if stale and not busy:
             _cache["news-bg"] = (time.time(), True)
 
@@ -602,14 +775,25 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/scan":
                 return self._send(200, read_json(DATA / "scan.json", {"hits": [], "as_of": ""}))
             if path == "/api/news":
-                return self._send(200, get_news())
+                return self._send(200, get_news(force=(qs.get("refresh") or [""])[0] == "1"))
+            if path == "/api/movers":
+                return self._send(200, get_movers())
+            if path == "/api/lookup":
+                syms = clean_symbols((qs.get("symbol") or [""])[0], 1)
+                if not syms:
+                    return self._send(400, {"error": "symbol required"})
+                try:
+                    return self._send(200, get_lookup(syms[0]))
+                except Exception:
+                    return self._send(404, {"error": "no chart data for " + syms[0]})
             if path == "/api/earnings":
                 return self._send(200, get_earnings(clean_symbols((qs.get("symbols") or [""])[0], 20)))
             if path == "/api/chain":
                 syms = clean_symbols((qs.get("symbol") or [""])[0], 1)
                 if not syms:
                     return self._send(400, {"error": "symbol required"})
-                return self._send(200, get_chain(syms[0]))
+                dq = (qs.get("date") or [""])[0]
+                return self._send(200, get_chain(syms[0], dq if re.match(r"^\d{4}-\d{2}-\d{2}$", dq) else None))
             if path == "/api/status":
                 return self._send(200, {"scan": {k: v for k, v in scan_state.items() if k != "failed_at"}, "now": iso(time.time()),
                                         "sec_user_agent": bool(os.environ.get("SEC_USER_AGENT"))})

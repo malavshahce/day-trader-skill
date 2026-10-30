@@ -82,7 +82,7 @@ function check(name, cond, extra) { if (cond) console.log("ok   " + name); else 
   check("initial render has Today content", /Market read/.test(await text(p, "#view")));
   check("clock shows ET", /ET/.test(await text(p, "#clock")));
   check("asof shows scan date", /scan 2026-10-29/.test(await text(p, "#asof")));
-  for (const [id] of [["today"], ["scanner"], ["planner"], ["options"], ["news"], ["journal"], ["ask"], ["settings"]]) {
+  for (const [id] of [["today"], ["scanner"], ["planner"], ["options"], ["news"], ["journal"], ["ask"], ["guide"], ["settings"]]) {
     await tab(p, id);
     const t = await text(p, "#view");
     check("tab " + id + " renders without undefined/NaN", t.length > 40 && !/undefined|NaN|\[object|Infinity/.test(t), t.match(/.{0,30}(undefined|NaN|\[object|Infinity).{0,30}/) + "");
@@ -159,8 +159,20 @@ function check(name, cond, extra) { if (cond) console.log("ok   " + name); else 
   const jt = await text(p, "#view"); check("journal close computes P&L +$10.00, 100% win, 2.00 R", /\$10\.00/.test(jt) && /100%/.test(jt) && /2\.00 avg R/.test(jt), jt.slice(0, 300));
   await click(p, '[data-act=jdel][aria-label*=ABC]'); await new Promise(r => setTimeout(r, 150));
   check("journal delete removes ABC", !/ABC/.test(await text(p, "#view")));
+  // planner in words, guide
+  await tab(p, "planner");
+  const pw = await text(p, "#p-out");
+  check("planner explains the plan in words (25 shares at $100, 2% stop, $50 loss, $100 gain)", /Your plan in words/.test(pw) && /Buy 25 shares of TSLA at about \$100\.00/.test(pw) && /If it falls to \$98\.00/.test(pw) && /lose about \$50\.00/.test(pw) && /make about \$100\.00/.test(pw), pw.slice(0, 200));
+  check("planner lists what to change when the market is closed", /What to change/.test(pw) && /market is closed/i.test(pw));
+  check("planner has the how-to box and step labels", /How to use this/.test(await text(p, "#view")) && /Step 1/i.test(await text(p, "#view")) && /Step 3/i.test(await text(p, "#view")));
+  await tab(p, "guide"); const gd = await text(p, "#view");
+  check("guide has routine, worked example, expiries and no web-only Movers tab", /A daily routine/.test(gd) && /Worked example/.test(gd) && /358\.32/.test(gd) && /LEAPS/.test(gd) && !/Check any stock/.test(gd));
   // options
   await tab(p, "options");
+  await click(p, '#c-dtes [data-v="0"]'); await new Promise(r => setTimeout(r, 100));
+  const z = (await text(p, "#c-out")).replace(/\n/g, " ");
+  check("0 DTE chip: expires today, no annualized rate", /Expires today/.test(z) && /n\/a \(same day\)/.test(z), z.slice(0, 200));
+  await click(p, '#c-dtes [data-v="45"]'); await new Promise(r => setTimeout(r, 100));
   out = await text(p, "#c-out");
   check("csp example: cash $1,950, breakeven 19.15, 0 contracts", /\$1,950/.test(out) && /19\.15/.test(out) && /Suggested contracts\s*0/.test(out.replace(/\n/g, " ")), out.slice(0, 300));
   await type(p, "#c-account", "50000"); await type(p, "#c-riskPct", "2");
@@ -170,7 +182,7 @@ function check(name, cond, extra) { if (cond) console.log("ok   " + name); else 
   await new Promise(r => setTimeout(r, 80));
   check("csp earnings before expiry warns (PFE Nov 3)", /reports Nov 3.*before this expiry/.test(await text(p, "#c-out")), (await text(p, "#c-out")).slice(-200));
   await p.evaluate(() => { const e = document.getElementById("c-expiry"); e.value = "2026-10-01"; e.dispatchEvent(new Event("input", { bubbles: true })); });
-  check("csp past expiry -> message", /after today/.test(await text(p, "#c-out")));
+  check("csp past expiry -> message", /today or later/.test(await text(p, "#c-out")));
   await type(p, "#c-premium", "");
   check("csp empty premium -> message", /premium|expiry/.test(await text(p, "#c-out")));
   // news
@@ -204,12 +216,12 @@ function check(name, cond, extra) { if (cond) console.log("ok   " + name); else 
   check("ask second turn", (await p.$$("#chat .bub.u")).length === 2);
   check("page errors none (full mode)", p.__errs.length === 0, p.__errs.join(" | "));
   // screenshots
-  for (const t of ["today", "scanner", "planner", "options", "news", "journal", "ask", "settings"]) { await tab(p, t); await p.screenshot({ path: path.join(OUT, `desk-light-${t}.png`) }); }
+  for (const t of ["today", "scanner", "planner", "options", "news", "journal", "ask", "guide", "settings"]) { await tab(p, t); await p.screenshot({ path: path.join(OUT, `desk-light-${t}.png`) }); }
   await p.close();
 
   /* ---------- 2. dark + mobile ---------- */
   p = await open("full", { width: 390, height: 844, isMobile: true, deviceScaleFactor: 2 }, "dark");
-  for (const t of ["today", "scanner", "planner", "options", "news", "journal", "ask", "settings"]) {
+  for (const t of ["today", "scanner", "planner", "options", "news", "journal", "ask", "guide", "settings"]) {
     await tab(p, t);
     const ov = await p.evaluate(() => ({ sw: document.documentElement.scrollWidth, iw: window.innerWidth }));
     check("mobile " + t + " no horizontal page scroll", ov.sw <= ov.iw + 1, JSON.stringify(ov));

@@ -183,44 +183,175 @@ class BatchQuotes(unittest.TestCase):
 
 
 class Options(unittest.TestCase):
-    def test_chain_parsing_and_filters(self):
+    @staticmethod
+    def stamp(days):
         today = server.eastern_now().date()
-        e1 = int(dt.datetime.combine(today + dt.timedelta(days=30), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
-        e2 = int(dt.datetime.combine(today + dt.timedelta(days=200), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
+        return int(dt.datetime.combine(today + dt.timedelta(days=days), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
 
-        def fake(url):
+    def fake(self, expiries, puts, price=21.21, seen=None):
+        def f(url):
             if "date=" in url:
-                return {"optionChain": {"result": [{"options": [{"puts": [
-                    {"strike": 19.5, "bid": 0.3, "ask": 0.4, "openInterest": 800, "volume": 5, "impliedVolatility": 0.35},
-                    {"strike": 5.0, "bid": 0, "ask": 0, "openInterest": 1},       # too far out of the money: dropped
-                    {"strike": 21.0, "bid": 0, "ask": 0, "openInterest": 10}]}]}]}}
-            return {"optionChain": {"result": [{"quote": {"regularMarketPrice": 21.21}, "expirationDates": [e1, e2]}]}}
-        orig = server.crumb_json; server.crumb_json = fake
+                if seen is not None:
+                    seen.append(int(url.split("date=")[1].split("&")[0]))
+                return {"optionChain": {"result": [{"options": [{"puts": puts}]}]}}
+            return {"optionChain": {"result": [{"quote": {"regularMarketPrice": price}, "expirationDates": expiries}]}}
+        return f
+
+    def run_chain(self, expiries, puts, date=None, price=21.21, seen=None):
+        orig = server.crumb_json; server.crumb_json = self.fake(expiries, puts, price, seen)
         try:
-            c = server.fetch_chain("KEY", 14, 60)
+            return server.fetch_chain("KEY", date)
         finally:
             server.crumb_json = orig
-        self.assertEqual(len(c["expiries"]), 1)                    # 200 days out is excluded
-        rows = c["expiries"][0]["puts"]
-        self.assertEqual([r["k"] for r in rows], [21.0, 19.5])     # sorted high to low, 5.0 dropped
+
+    def test_every_expiry_is_listed_from_today_to_long_dated(self):
+        days = [0, 4, 5, 7, 14, 21, 49, 112, 400, 812]
+        c = self.run_chain([self.stamp(d) for d in days], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}])
+        self.assertEqual([x["dte"] for x in c["all"]], days)                    # 0 DTE and LEAPS are both there
+        self.assertEqual(c["sel"]["dte"], 7)                                   # default is the one nearest 7 days
+
+    def test_past_expiries_are_dropped(self):
+        c = self.run_chain([self.stamp(-3), self.stamp(2)], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}])
+        self.assertEqual([x["dte"] for x in c["all"]], [2])
+
+    def test_a_requested_date_picks_that_expiry_and_only_that_is_fetched(self):
+        seen = []
+        days = [0, 7, 14, 400]
+        target = (server.eastern_now().date() + dt.timedelta(days=400)).isoformat()
+        c = self.run_chain([self.stamp(d) for d in days], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}], date=target, seen=seen)
+        self.assertEqual((c["sel"]["date"], c["sel"]["dte"]), (target, 400))
+        self.assertEqual(seen, [self.stamp(400)])                              # one puts call, not one per expiry
+        c2 = self.run_chain([self.stamp(0), self.stamp(7)], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}], date="2099-01-01")
+        self.assertEqual(c2["sel"]["dte"], 7)                                  # unknown date falls back to the default
+
+    def test_put_rows_parsing_and_filters(self):
+        puts = [{"strike": 19.5, "bid": 0.3, "ask": 0.4, "openInterest": 800, "volume": 5, "impliedVolatility": 0.35},
+                {"strike": 5.0, "bid": 0, "ask": 0, "openInterest": 1},          # far out of the money: dropped
+                {"strike": 21.0, "bid": 0, "ask": 0, "openInterest": 10}]
+        c = self.run_chain([self.stamp(7)], puts)
+        rows = c["sel"]["puts"]
+        self.assertEqual([r["k"] for r in rows], [21.0, 19.5])
         r = rows[1]
         self.assertEqual(r["mid"], 0.35); self.assertEqual(r["spread"], round(0.1 / 0.35 * 100, 1)); self.assertEqual(r["iv"], 35.0)
-        self.assertIsNone(rows[0]["mid"])
-        self.assertTrue(c["live_quotes"])
+        self.assertIsNone(rows[0]["mid"]); self.assertTrue(c["live_quotes"])
 
     def test_no_live_quotes_flag(self):
-        today = server.eastern_now().date()
-        e1 = int(dt.datetime.combine(today + dt.timedelta(days=30), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
+        c = self.run_chain([self.stamp(7)], [{"strike": 20.0, "bid": 0, "ask": 0}], price=21.0)
+        self.assertFalse(c["live_quotes"])
 
-        def fake(url):
-            if "date=" in url:
-                return {"optionChain": {"result": [{"options": [{"puts": [{"strike": 20.0, "bid": 0, "ask": 0}]}]}]}}
-            return {"optionChain": {"result": [{"quote": {"regularMarketPrice": 21.0}, "expirationDates": [e1]}]}}
-        orig = server.crumb_json; server.crumb_json = fake
+    def test_no_expiries_is_an_error(self):
+        with self.assertRaises(RuntimeError):
+            self.run_chain([self.stamp(-2)], [])
+
+
+class Movers(unittest.TestCase):
+    def row(self, sym, reg=100.0, rt=1000, post=None, pot=None, pre=None, pt=None, day=0.5, earn=None, vol=2_000_000):
+        return {"symbol": sym, "shortName": sym + " Inc", "regularMarketPrice": reg, "regularMarketTime": rt, "postMarketPrice": post, "postMarketTime": pot,
+                "preMarketPrice": pre, "preMarketTime": pt, "regularMarketChangePercent": day, "earningsTimestamp": earn, "regularMarketVolume": vol}
+
+    def test_after_hours_move_is_measured_from_the_close(self):
+        r = server.mover_row(self.row("AMZN", reg=243.79, post=225.99, pot=2000, day=1.0), {})
+        self.assertEqual((r["ses"], r["p"], r["close"]), ("post", 225.99, 243.79))
+        self.assertEqual(r["move"], round((225.99 / 243.79 - 1) * 100, 2))
+
+    def test_during_the_day_the_move_is_the_day_change(self):
+        r = server.mover_row(self.row("X", day=4.2), {})
+        self.assertEqual((r["ses"], r["move"]), ("reg", 4.2))
+
+    def test_stale_extended_price_before_the_regular_time_is_ignored(self):
+        r = server.mover_row(self.row("X", rt=5000, post=90.0, pot=4000, day=1.5), {})
+        self.assertEqual((r["ses"], r["move"]), ("reg", 1.5))
+
+    def test_no_price_returns_none(self):
+        self.assertIsNone(server.mover_row({"symbol": "X"}, {}))
+
+    def test_earnings_timing_in_new_york(self):
+        utc = dt.timezone.utc
+        after = int(dt.datetime(2026, 10, 29, 20, 5, tzinfo=utc).timestamp())    # 4:05 pm ET
+        before = int(dt.datetime(2026, 10, 29, 11, 30, tzinfo=utc).timestamp())  # 7:30 am ET
+        during = int(dt.datetime(2026, 10, 29, 16, 0, tzinfo=utc).timestamp())   # noon ET
+        self.assertEqual(server.et_date_and_when(after), ("2026-10-29", "post"))
+        self.assertEqual(server.et_date_and_when(before), ("2026-10-29", "pre"))
+        self.assertEqual(server.et_date_and_when(during), ("2026-10-29", ""))
+        self.assertEqual(server.et_date_and_when(None), (None, ""))
+
+    def test_get_movers_ranks_by_size_and_builds_list_first(self):
+        tmp = tempfile.mkdtemp(); old = server.DATA; server.DATA = Path(tmp); server._cache.clear()
+        orig_raw, orig_build = server.raw_batch, server.build_liquid
         try:
-            self.assertFalse(server.fetch_chain("KEY", 14, 60)["live_quotes"])
+            server.build_liquid = lambda: None
+            first = server.get_movers()
+            self.assertTrue(first["building"]); self.assertEqual(first["rows"], [])
+            (Path(tmp) / "liquid.json").write_text(json.dumps({"at": "x", "symbols": ["AAA", "BBB", "CCC"], "names": {"AAA": "Alpha"}}))
+            server.raw_batch = lambda syms: [self.row("AAA", post=110.0, pot=2000), self.row("BBB", post=70.0, pot=2000), self.row("CCC", post=101.0, pot=2000)]
+            server._cache.clear()
+            out = server.get_movers()
+            self.assertEqual([r["s"] for r in out["rows"]], ["BBB", "AAA"])      # CCC moved 1%: under the 2% floor
+            self.assertEqual(out["rows"][1]["n"], "Alpha")
         finally:
-            server.crumb_json = orig
+            server.raw_batch, server.build_liquid, server.DATA = orig_raw, orig_build, old
+            server._cache.clear()
+
+
+class Lookup(unittest.TestCase):
+    def test_explains_why_a_stock_does_not_match(self):
+        closes = [100.0 + (i % 5) * 0.1 for i in range(60)]
+        stamps = [1_700_000_000 + 86400 * i for i in range(60)]
+        orig, orig_e = server.http_json, server.fetch_earnings
+        server.http_json = lambda url, **k: {"chart": {"result": [{"meta": {"longName": "Test Co"}, "timestamp": stamps, "indicators": {"quote": [{"close": closes}]}}]}}
+        server.fetch_earnings = lambda syms: {syms[0]: {"earn": "2026-10-29", "div": 0}}
+        try:
+            d = server.lookup("TEST")
+        finally:
+            server.http_json, server.fetch_earnings = orig, orig_e
+        self.assertEqual(d["name"], "Test Co"); self.assertEqual(d["earn"], "2026-10-29")
+        self.assertEqual({c["k"] for c in d["checks"]}, {"breakout_20d", "reclaim_ma20", "bull_flag", "oversold", "oversold_bounce"})
+        self.assertTrue(all(isinstance(c["why"], str) and c["why"] for c in d["checks"]))
+        self.assertEqual(d["setups"], [c["k"] for c in d["checks"] if c["match"]])
+
+    def test_a_real_breakout_is_reported(self):
+        closes = [100.0] * 40 + [100.0 + i for i in range(1, 21)]            # steady, then a run to new highs
+        stamps = [1_700_000_000 + 86400 * i for i in range(60)]
+        orig = server.http_json
+        server.http_json = lambda url, **k: {"chart": {"result": [{"meta": {}, "timestamp": stamps, "indicators": {"quote": [{"close": closes}]}}]}}
+        orig_e = server.fetch_earnings; server.fetch_earnings = lambda syms: {}
+        try:
+            d = server.lookup("UP")
+        finally:
+            server.http_json, server.fetch_earnings = orig, orig_e
+        self.assertIn("breakout_20d", d["setups"]); self.assertTrue(next(c for c in d["checks"] if c["k"] == "breakout_20d")["match"])
+
+    def test_too_little_history_is_an_error(self):
+        orig = server.http_json
+        server.http_json = lambda url, **k: {"chart": {"result": [{"meta": {}, "timestamp": [1, 2, 3], "indicators": {"quote": [{"close": [1.0, 2.0, 3.0]}]}}]}}
+        try:
+            with self.assertRaises(RuntimeError):
+                server.lookup("NEW")
+        finally:
+            server.http_json = orig
+
+
+class News(unittest.TestCase):
+    def test_force_refresh_is_rate_limited_and_flagged(self):
+        tmp = tempfile.mkdtemp(); old, orig = server.DATA, server.refresh_news
+        server.DATA = Path(tmp); server._cache.clear()
+        calls = []
+        server.refresh_news = lambda: calls.append(1)
+        try:
+            (Path(tmp) / "news.json").write_text(json.dumps({"checked": "x", "items": [], "moves": {}}))
+            fresh = server.get_news(force=True)             # file is seconds old: forced refresh is ignored
+            self.assertFalse(fresh["refreshing"]); time.sleep(0.1); self.assertEqual(calls, [])
+            os.utime(Path(tmp) / "news.json", (time.time() - 120, time.time() - 120))
+            forced = server.get_news(force=True)            # two minutes old: allowed
+            self.assertTrue(forced["refreshing"]); time.sleep(0.3); self.assertEqual(len(calls), 1)
+            os.utime(Path(tmp) / "news.json", (time.time() - 400, time.time() - 400))
+            server._cache.clear(); self.assertTrue(server.get_news()["refreshing"])   # older than 5 minutes refreshes on its own
+        finally:
+            server.DATA, server.refresh_news = old, orig
+            server._cache.clear()
+
+    def test_market_headline_sources_are_always_watched(self):
+        self.assertIn("SPY", server.watch_set()); self.assertIn("QQQ", server.watch_set())
 
 
 class Http(unittest.TestCase):
