@@ -1,10 +1,12 @@
 import base64
+import gzip
 import datetime as dt
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -62,11 +64,11 @@ class Helpers(unittest.TestCase):
 
 class Quotes(unittest.TestCase):
     def setUp(self):
-        self._orig = server.http_json
+        self._orig, self._crumb = server.http_json, server.crumb_json
         server._cache.clear()
 
     def tearDown(self):
-        server.http_json = self._orig
+        server.http_json, server.crumb_json = self._orig, self._crumb
 
     def test_latest_bar_and_percent(self):
         server.http_json = lambda url, **k: chart([100.0, None, 101.5, None], prev=100.0)
@@ -79,6 +81,7 @@ class Quotes(unittest.TestCase):
         self.assertEqual(server.fetch_quote("X")["p"], 10.5)
 
     def test_no_price_raises_and_batch_survives(self):
+        server.crumb_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("batch down"))   # force the per-symbol fallback
         def fake(url, **k):
             if "BAD" in url:
                 raise RuntimeError("fetch failed: HTTP Error 404")
@@ -108,6 +111,75 @@ class Quotes(unittest.TestCase):
         (Path(d) / "market.json").write_text(json.dumps({"as_of": "2026-10-29", "idx": {"^VIX": {}}}))
         server.http_json = lambda url, **k: (_ for _ in ()).throw(RuntimeError("down"))
         self.assertEqual(server.get_market()["as_of"], "2026-10-29")
+
+
+class BatchQuotes(unittest.TestCase):
+    def setUp(self):
+        self._orig, self._crumb = server.http_json, server.crumb_json
+        server._cache.clear()
+
+    def tearDown(self):
+        server.http_json, server.crumb_json = self._orig, self._crumb
+
+    @staticmethod
+    def row(sym, reg=100.0, rt=1000, pre=None, pt=None, post=None, pot=None, prev=98.0):
+        return {"symbol": sym, "regularMarketPrice": reg, "regularMarketTime": rt, "preMarketPrice": pre, "preMarketTime": pt,
+                "postMarketPrice": post, "postMarketTime": pot, "regularMarketPreviousClose": prev}
+
+    def test_latest_session_wins(self):
+        self.assertEqual(server.parse_batch_quote(self.row("A"))["ses"], "reg")
+        q = server.parse_batch_quote(self.row("A", post=101.0, pot=2000))
+        self.assertEqual((q["p"], q["ses"]), (101.0, "post"))
+        q = server.parse_batch_quote(self.row("A", pre=99.0, pt=900))      # pre-market older than the regular price: ignored
+        self.assertEqual(q["ses"], "reg")
+        q = server.parse_batch_quote(self.row("A", rt=500, pre=99.5, pt=900))
+        self.assertEqual((q["p"], q["ses"]), (99.5, "pre"))
+        self.assertEqual(server.parse_batch_quote(self.row("A", post=101.0, pot=2000))["pct"], round((101.0 / 98.0 - 1) * 100, 2))
+        with self.assertRaises(ValueError):
+            server.parse_batch_quote({"symbol": "X"})
+
+    def test_sixty_symbols_use_one_call(self):
+        calls = []
+        syms = ["S%d" % i for i in range(60)]
+        def fake(url):
+            calls.append(url)
+            return {"quoteResponse": {"result": [self.row(s) for s in syms if s != "S7"]}}
+        server.crumb_json = fake
+        server.http_json = lambda *a, **k: (_ for _ in ()).throw(AssertionError("chart route must not be used"))
+        res = server.get_quotes(",".join(syms))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(res["quotes"]["S0"]["p"], 100.0)
+        self.assertIn("err", res["quotes"]["S7"])
+        self.assertEqual(len(res["quotes"]), 60)
+
+    def test_cached_symbols_skip_the_network(self):
+        calls = []
+        server.crumb_json = lambda url: (calls.append(url), {"quoteResponse": {"result": [self.row("AAA"), self.row("BBB")]}})[1]
+        server.get_quotes("AAA,BBB"); server.get_quotes("AAA,BBB")
+        self.assertEqual(len(calls), 1)
+        server.get_quotes("AAA,CCC")                       # only CCC is new, but one call is still enough
+        self.assertEqual(len(calls), 2); self.assertIn("CCC", calls[1]); self.assertNotIn("AAA", calls[1].split("symbols=")[1].split("&")[0])
+
+    def test_falls_back_to_chart_when_batch_route_fails(self):
+        server.crumb_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("429"))
+        server.http_json = lambda url, **k: chart([10.0, 11.0], prev=10.0)
+        res = server.get_quotes("AAA,BBB")
+        self.assertEqual(res["quotes"]["AAA"]["p"], 11.0); self.assertEqual(res["quotes"]["BBB"]["pct"], 10.0)
+
+    def test_cached_dedupes_simultaneous_requests(self):
+        server._cache.clear(); calls = []
+        def slow():
+            calls.append(1); time.sleep(0.3); return "v"
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(server.cached("dedupe-key", 30, slow))) for _ in range(10)]
+        [x.start() for x in ts]; [x.join() for x in ts]
+        self.assertEqual(len(calls), 1); self.assertEqual(out, ["v"] * 10)
+
+    def test_cache_is_bounded(self):
+        server._cache.clear()
+        for i in range(3100):
+            server.cached("k%d" % i, 60, lambda: 1)
+        self.assertLess(len(server._cache), 3100)
 
 
 class Options(unittest.TestCase):
@@ -162,9 +234,12 @@ class Http(unittest.TestCase):
         cls.port = cls.srv.server_address[1]
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         server.http_json = lambda url, **k: chart([20.0, 21.0], prev=20.0)
+        cls._crumb = server.crumb_json
+        server.crumb_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no batch in tests"))
 
     @classmethod
     def tearDownClass(cls):
+        server.crumb_json = cls._crumb
         cls.srv.shutdown()
         os.environ.pop("DESK_PASSWORD", None)
 
@@ -194,6 +269,29 @@ class Http(unittest.TestCase):
             self.assertEqual(self.req(bad)[0], 404, bad)
         s, body, h = self.req("/lib.js")
         self.assertEqual(s, 200); self.assertIn(b"TraderLib", body); self.assertIn("javascript", h["Content-Type"])
+
+    def test_gzip_and_etag(self):
+        def get(path, headers):
+            r = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path))
+            r.add_header("Authorization", "Basic " + base64.b64encode(b"me:s3cret-pw").decode())
+            for k, v in headers.items():
+                r.add_header(k, v)
+            try:
+                with urllib.request.urlopen(r, timeout=10) as resp:
+                    return resp.status, resp.read(), resp.headers
+            except urllib.error.HTTPError as e:
+                return e.code, e.read(), e.headers
+        plain = get("/api/scan", {})[1]
+        s, zipped, h = get("/api/scan", {"Accept-Encoding": "gzip"})
+        self.assertEqual(h["Content-Encoding"], "gzip"); self.assertLess(len(zipped), len(plain) / 2)
+        self.assertEqual(gzip.decompress(zipped), plain)
+        self.assertNotIn("Content-Encoding", get("/api/scan", {})[2])
+        s, body, h = get("/lib.js", {"Accept-Encoding": "gzip"})
+        etag = h["ETag"]; self.assertTrue(etag); self.assertEqual(h["Cache-Control"], "no-cache")
+        s2, body2, h2 = get("/lib.js", {"If-None-Match": etag, "Accept-Encoding": "gzip"})
+        self.assertEqual(s2, 304); self.assertEqual(body2, b"")
+        self.assertNotEqual(get("/lib.js", {"If-None-Match": '"stale"'})[0], 304)
+        self.assertEqual(get("/api/scan", {})[2]["Cache-Control"], "no-store")
 
     def test_security_headers(self):
         _, _, h = self.req("/api/scan")

@@ -176,7 +176,7 @@ LIVE = r'''
   function scheduleLive() { clearTimeout(symTimer); symTimer = setTimeout(function () { ensureQuotes(false); }, 500); }
   function lvHtml(q) {
     if (!q || q.err) return '<span class="muted">–</span>';
-    return q.p.toFixed(2) + (isFinite(q.pct) ? ' <span class="' + cls(q.pct) + ' small">' + fmtPct(q.pct) + "</span>" : "");
+    return q.p.toFixed(2) + (q.ses === "post" ? ' <span class="muted small">AH</span>' : q.ses === "pre" ? ' <span class="muted small">PM</span>' : "") + (isFinite(q.pct) ? ' <span class="' + cls(q.pct) + ' small">' + fmtPct(q.pct) + "</span>" : "");
   }
   function quoteTime(q) {
     if (!q || !q.t) return "";

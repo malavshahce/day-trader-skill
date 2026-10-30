@@ -21,6 +21,8 @@ Environment:
 
 import base64
 import datetime as dt
+import gzip
+import hashlib
 import hmac
 import http.cookiejar
 import json
@@ -54,17 +56,31 @@ _cache = {}
 
 # ------------------------------------------------------------------ small helpers
 
+_key_locks = {}
+
+
 def cached(key, ttl, fn):
-    """Return fn() for key, reusing a value younger than ttl seconds."""
-    now = time.time()
+    """Return fn() for key, reusing a value younger than ttl seconds.
+
+    Simultaneous callers for the same key share one fetch instead of each calling the data source."""
     with _lock:
         hit = _cache.get(key)
-        if hit and now - hit[0] < ttl:
+        if hit and time.time() - hit[0] < ttl:
             return hit[1]
-    value = fn()
-    with _lock:
-        _cache[key] = (time.time(), value)
-    return value
+        klock = _key_locks.setdefault(key, threading.Lock())
+    with klock:
+        with _lock:
+            hit = _cache.get(key)
+            if hit and time.time() - hit[0] < ttl:
+                return hit[1]
+        value = fn()
+        with _lock:
+            _cache[key] = (time.time(), value)
+            if len(_cache) > 3000:   # keep memory flat on a small host
+                for k, _ in sorted(_cache.items(), key=lambda kv: kv[1][0])[:1000]:
+                    _cache.pop(k, None)
+                    _key_locks.pop(k, None)
+        return value
 
 
 def http_json(url, timeout=15, opener=None):
@@ -140,6 +156,39 @@ def fetch_quote(sym):
     return out
 
 
+def parse_batch_quote(r):
+    """One entry of Yahoo's batch quote reply -> {p, pc, pct, t, ses}. The latest of regular, pre and post wins."""
+    cands = []
+    for pk, tk, ses in (("regularMarketPrice", "regularMarketTime", "reg"), ("preMarketPrice", "preMarketTime", "pre"),
+                        ("postMarketPrice", "postMarketTime", "post")):
+        p, t = r.get(pk), r.get(tk)
+        if p is not None and t:
+            cands.append((t, float(p), ses))
+    if not cands:
+        if r.get("regularMarketPrice") is None:
+            raise ValueError("no price")
+        cands.append((0, float(r["regularMarketPrice"]), "reg"))
+    t, p, ses = max(cands)
+    out = {"p": round(p, 4), "t": iso(t) if t else None, "ses": ses}
+    prev = r.get("regularMarketPreviousClose")
+    if prev:
+        out["pc"] = round(float(prev), 4)
+        out["pct"] = round((p / float(prev) - 1) * 100, 2)
+    return out
+
+
+def fetch_quotes_batch(symbols):
+    """Up to 60 symbols in ONE Yahoo call (the per-symbol chart route needs one call each)."""
+    url = "https://query2.finance.yahoo.com/v7/finance/quote?symbols=%s&crumb={crumb}" % urllib.parse.quote(",".join(symbols))
+    got = {}
+    for r in crumb_json(url)["quoteResponse"]["result"]:
+        try:
+            got[r["symbol"]] = parse_batch_quote(r)
+        except (ValueError, KeyError):
+            pass
+    return got
+
+
 def get_quote(sym):
     try:
         return cached("q:" + sym, 15, lambda: fetch_quote(sym))
@@ -149,9 +198,31 @@ def get_quote(sym):
 
 def get_quotes(symbols):
     symbols = clean_symbols(",".join(symbols) if isinstance(symbols, list) else symbols)
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        results = list(ex.map(get_quote, symbols))
-    return {"as_of": iso(time.time()), "quotes": dict(zip(symbols, results))}
+    out, need, now = {}, [], time.time()
+    with _lock:
+        for sym in symbols:
+            hit = _cache.get("q:" + sym)
+            if hit and now - hit[0] < 15:
+                out[sym] = hit[1]
+            else:
+                need.append(sym)
+    if need:
+        try:
+            got = fetch_quotes_batch(need)
+            for sym in need:
+                q = got.get(sym)
+                if q:
+                    with _lock:
+                        _cache["q:" + sym] = (time.time(), q)
+                    out[sym] = q
+                else:
+                    out[sym] = {"err": "no data for " + sym}
+        except Exception:
+            # batch route is down: fall back to one chart call per symbol
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                for sym, q in zip(need, ex.map(get_quote, need)):
+                    out[sym] = q
+    return {"as_of": iso(time.time()), "quotes": {s: out[s] for s in symbols}}
 
 
 def fetch_index(sym, name):
@@ -418,6 +489,7 @@ def expected_scan_date(now_et):
 
 
 def scheduler():
+    time.sleep(60)
     while True:
         try:
             scan = read_json(DATA / "scan.json", {"as_of": ""})
@@ -442,25 +514,36 @@ _fails = {}
 class Handler(BaseHTTPRequestHandler):
     server_version = "TraderDesk"
     protocol_version = "HTTP/1.1"
+    timeout = 20   # drop connections that stall instead of holding a thread forever
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
-    def _send(self, code, body=b"", ctype="application/json", extra=None):
+    def _send(self, code, body=b"", ctype="application/json", extra=None, static=False):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, separators=(",", ":")).encode()
         elif isinstance(body, str):
             body = body.encode()
+        extra = dict(extra or {})
+        if static:   # revalidate with an ETag: unchanged files cost a 304, not 70 KB
+            etag = '"%s"' % hashlib.sha1(body).hexdigest()[:20]
+            extra["ETag"] = etag
+            if self.headers.get("If-None-Match") == etag:
+                code, body = 304, b""
+        if code != 304 and len(body) > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):
+            body = gzip.compress(body, 6)
+            extra["Content-Encoding"] = "gzip"
+        extra["Vary"] = "Accept-Encoding"
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", CSP)
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-cache" if static else "no-store")
         if self.headers.get("X-Forwarded-Proto") == "https":
             self.send_header("Strict-Transport-Security", "max-age=31536000")
-        for k, v in (extra or {}).items():
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -474,6 +557,9 @@ class Handler(BaseHTTPRequestHandler):
         if not pw:
             return True
         ip, now = self._client(), time.time()
+        if len(_fails) > 500:
+            for k in [k for k, v in _fails.items() if not v or now - v[-1] > 300]:
+                _fails.pop(k, None)
         recent = [t for t in _fails.get(ip, []) if now - t < 300]
         _fails[ip] = recent
         if len(recent) >= 10:
@@ -502,7 +588,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in STATIC_FILES:
             f, ctype = STATIC_FILES[path]
             try:
-                return self._send(200, f.read_bytes(), ctype)
+                return self._send(200, f.read_bytes(), ctype, static=True)
             except OSError:
                 return self._send(404, {"error": "missing file"})
         try:
