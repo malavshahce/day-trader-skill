@@ -1,0 +1,17 @@
+# Render blueprint for Trader Desk (read-only dashboard with live prices).
+# Render: New > Blueprint > pick this repo. It will ask for the two secret values below.
+services:
+  - type: web
+    name: trader-desk
+    runtime: python
+    plan: free
+    buildCommand: echo "no build step, standard library only"
+    startCommand: python3 webapp/server.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: DESK_PASSWORD        # required: the password for the site (any user name)
+        sync: false
+      - key: SEC_USER_AGENT       # "Your Name you@example.com", used for SEC filings in the news
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.7

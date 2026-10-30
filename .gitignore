@@ -4,3 +4,6 @@ trader/
 *.key
 .DS_Store
 __pycache__/
+
+# web app runtime data
+webapp/data/

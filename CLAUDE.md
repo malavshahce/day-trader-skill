@@ -18,3 +18,9 @@ Never skip `/trader-risk` before `/trader-broker`.
 - `trader/config.json`: starter limits ($5,000 budget, $50 max loss/trade, $150 daily, 3 trades/day). Edit to match the real account.
 - `sec_user_agent` in config (or `SEC_USER_AGENT` env) must be "Name email" for news filings and the analyst.
 - Alpaca paper MCP server: not connected yet (see `.claude/skills/trader-broker/SKILL.md`).
+
+## Web app and dashboard
+- `webapp/` is a read-only website with live prices (server fetches Yahoo). Run: `DESK_PASSWORD=... python3 webapp/server.py`. Deploy notes in `webapp/README.md`, blueprint in `render.yaml`.
+- `dashboard/` is the page published on claude.ai (private artifact). Its source is `dashboard/src/index.src.html`; `webapp/build_ui.py` derives the web app page from it.
+- Tests: `node dashboard/tests/test_lib.js`, `python3 -m unittest discover -s webapp/tests`, `node webapp/tests/e2e_web.js` (needs puppeteer-core and Chrome).
+- The web app must never gain order endpoints or read broker keys.
