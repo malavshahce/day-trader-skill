@@ -1,10 +1,12 @@
 import base64
+import gzip
 import datetime as dt
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -62,11 +64,11 @@ class Helpers(unittest.TestCase):
 
 class Quotes(unittest.TestCase):
     def setUp(self):
-        self._orig = server.http_json
+        self._orig, self._crumb = server.http_json, server.crumb_json
         server._cache.clear()
 
     def tearDown(self):
-        server.http_json = self._orig
+        server.http_json, server.crumb_json = self._orig, self._crumb
 
     def test_latest_bar_and_percent(self):
         server.http_json = lambda url, **k: chart([100.0, None, 101.5, None], prev=100.0)
@@ -79,6 +81,7 @@ class Quotes(unittest.TestCase):
         self.assertEqual(server.fetch_quote("X")["p"], 10.5)
 
     def test_no_price_raises_and_batch_survives(self):
+        server.crumb_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("batch down"))   # force the per-symbol fallback
         def fake(url, **k):
             if "BAD" in url:
                 raise RuntimeError("fetch failed: HTTP Error 404")
@@ -110,45 +113,245 @@ class Quotes(unittest.TestCase):
         self.assertEqual(server.get_market()["as_of"], "2026-10-29")
 
 
-class Options(unittest.TestCase):
-    def test_chain_parsing_and_filters(self):
-        today = server.eastern_now().date()
-        e1 = int(dt.datetime.combine(today + dt.timedelta(days=30), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
-        e2 = int(dt.datetime.combine(today + dt.timedelta(days=200), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
+class BatchQuotes(unittest.TestCase):
+    def setUp(self):
+        self._orig, self._crumb = server.http_json, server.crumb_json
+        server._cache.clear()
 
+    def tearDown(self):
+        server.http_json, server.crumb_json = self._orig, self._crumb
+
+    @staticmethod
+    def row(sym, reg=100.0, rt=1000, pre=None, pt=None, post=None, pot=None, prev=98.0):
+        return {"symbol": sym, "regularMarketPrice": reg, "regularMarketTime": rt, "preMarketPrice": pre, "preMarketTime": pt,
+                "postMarketPrice": post, "postMarketTime": pot, "regularMarketPreviousClose": prev}
+
+    def test_latest_session_wins(self):
+        self.assertEqual(server.parse_batch_quote(self.row("A"))["ses"], "reg")
+        q = server.parse_batch_quote(self.row("A", post=101.0, pot=2000))
+        self.assertEqual((q["p"], q["ses"]), (101.0, "post"))
+        q = server.parse_batch_quote(self.row("A", pre=99.0, pt=900))      # pre-market older than the regular price: ignored
+        self.assertEqual(q["ses"], "reg")
+        q = server.parse_batch_quote(self.row("A", rt=500, pre=99.5, pt=900))
+        self.assertEqual((q["p"], q["ses"]), (99.5, "pre"))
+        self.assertEqual(server.parse_batch_quote(self.row("A", post=101.0, pot=2000))["pct"], round((101.0 / 98.0 - 1) * 100, 2))
+        with self.assertRaises(ValueError):
+            server.parse_batch_quote({"symbol": "X"})
+
+    def test_sixty_symbols_use_one_call(self):
+        calls = []
+        syms = ["S%d" % i for i in range(60)]
         def fake(url):
+            calls.append(url)
+            return {"quoteResponse": {"result": [self.row(s) for s in syms if s != "S7"]}}
+        server.crumb_json = fake
+        server.http_json = lambda *a, **k: (_ for _ in ()).throw(AssertionError("chart route must not be used"))
+        res = server.get_quotes(",".join(syms))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(res["quotes"]["S0"]["p"], 100.0)
+        self.assertIn("err", res["quotes"]["S7"])
+        self.assertEqual(len(res["quotes"]), 60)
+
+    def test_cached_symbols_skip_the_network(self):
+        calls = []
+        server.crumb_json = lambda url: (calls.append(url), {"quoteResponse": {"result": [self.row("AAA"), self.row("BBB")]}})[1]
+        server.get_quotes("AAA,BBB"); server.get_quotes("AAA,BBB")
+        self.assertEqual(len(calls), 1)
+        server.get_quotes("AAA,CCC")                       # only CCC is new, but one call is still enough
+        self.assertEqual(len(calls), 2); self.assertIn("CCC", calls[1]); self.assertNotIn("AAA", calls[1].split("symbols=")[1].split("&")[0])
+
+    def test_falls_back_to_chart_when_batch_route_fails(self):
+        server.crumb_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("429"))
+        server.http_json = lambda url, **k: chart([10.0, 11.0], prev=10.0)
+        res = server.get_quotes("AAA,BBB")
+        self.assertEqual(res["quotes"]["AAA"]["p"], 11.0); self.assertEqual(res["quotes"]["BBB"]["pct"], 10.0)
+
+    def test_cached_dedupes_simultaneous_requests(self):
+        server._cache.clear(); calls = []
+        def slow():
+            calls.append(1); time.sleep(0.3); return "v"
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(server.cached("dedupe-key", 30, slow))) for _ in range(10)]
+        [x.start() for x in ts]; [x.join() for x in ts]
+        self.assertEqual(len(calls), 1); self.assertEqual(out, ["v"] * 10)
+
+    def test_cache_is_bounded(self):
+        server._cache.clear()
+        for i in range(3100):
+            server.cached("k%d" % i, 60, lambda: 1)
+        self.assertLess(len(server._cache), 3100)
+
+
+class Options(unittest.TestCase):
+    @staticmethod
+    def stamp(days):
+        today = server.eastern_now().date()
+        return int(dt.datetime.combine(today + dt.timedelta(days=days), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
+
+    def fake(self, expiries, puts, price=21.21, seen=None):
+        def f(url):
             if "date=" in url:
-                return {"optionChain": {"result": [{"options": [{"puts": [
-                    {"strike": 19.5, "bid": 0.3, "ask": 0.4, "openInterest": 800, "volume": 5, "impliedVolatility": 0.35},
-                    {"strike": 5.0, "bid": 0, "ask": 0, "openInterest": 1},       # too far out of the money: dropped
-                    {"strike": 21.0, "bid": 0, "ask": 0, "openInterest": 10}]}]}]}}
-            return {"optionChain": {"result": [{"quote": {"regularMarketPrice": 21.21}, "expirationDates": [e1, e2]}]}}
-        orig = server.crumb_json; server.crumb_json = fake
+                if seen is not None:
+                    seen.append(int(url.split("date=")[1].split("&")[0]))
+                return {"optionChain": {"result": [{"options": [{"puts": puts}]}]}}
+            return {"optionChain": {"result": [{"quote": {"regularMarketPrice": price}, "expirationDates": expiries}]}}
+        return f
+
+    def run_chain(self, expiries, puts, date=None, price=21.21, seen=None):
+        orig = server.crumb_json; server.crumb_json = self.fake(expiries, puts, price, seen)
         try:
-            c = server.fetch_chain("KEY", 14, 60)
+            return server.fetch_chain("KEY", date)
         finally:
             server.crumb_json = orig
-        self.assertEqual(len(c["expiries"]), 1)                    # 200 days out is excluded
-        rows = c["expiries"][0]["puts"]
-        self.assertEqual([r["k"] for r in rows], [21.0, 19.5])     # sorted high to low, 5.0 dropped
+
+    def test_every_expiry_is_listed_from_today_to_long_dated(self):
+        days = [0, 4, 5, 7, 14, 21, 49, 112, 400, 812]
+        c = self.run_chain([self.stamp(d) for d in days], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}])
+        self.assertEqual([x["dte"] for x in c["all"]], days)                    # 0 DTE and LEAPS are both there
+        self.assertEqual(c["sel"]["dte"], 7)                                   # default is the one nearest 7 days
+
+    def test_past_expiries_are_dropped(self):
+        c = self.run_chain([self.stamp(-3), self.stamp(2)], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}])
+        self.assertEqual([x["dte"] for x in c["all"]], [2])
+
+    def test_a_requested_date_picks_that_expiry_and_only_that_is_fetched(self):
+        seen = []
+        days = [0, 7, 14, 400]
+        target = (server.eastern_now().date() + dt.timedelta(days=400)).isoformat()
+        c = self.run_chain([self.stamp(d) for d in days], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}], date=target, seen=seen)
+        self.assertEqual((c["sel"]["date"], c["sel"]["dte"]), (target, 400))
+        self.assertEqual(seen, [self.stamp(400)])                              # one puts call, not one per expiry
+        c2 = self.run_chain([self.stamp(0), self.stamp(7)], [{"strike": 20.0, "bid": 0.2, "ask": 0.3}], date="2099-01-01")
+        self.assertEqual(c2["sel"]["dte"], 7)                                  # unknown date falls back to the default
+
+    def test_put_rows_parsing_and_filters(self):
+        puts = [{"strike": 19.5, "bid": 0.3, "ask": 0.4, "openInterest": 800, "volume": 5, "impliedVolatility": 0.35},
+                {"strike": 5.0, "bid": 0, "ask": 0, "openInterest": 1},          # far out of the money: dropped
+                {"strike": 21.0, "bid": 0, "ask": 0, "openInterest": 10}]
+        c = self.run_chain([self.stamp(7)], puts)
+        rows = c["sel"]["puts"]
+        self.assertEqual([r["k"] for r in rows], [21.0, 19.5])
         r = rows[1]
         self.assertEqual(r["mid"], 0.35); self.assertEqual(r["spread"], round(0.1 / 0.35 * 100, 1)); self.assertEqual(r["iv"], 35.0)
-        self.assertIsNone(rows[0]["mid"])
-        self.assertTrue(c["live_quotes"])
+        self.assertIsNone(rows[0]["mid"]); self.assertTrue(c["live_quotes"])
 
     def test_no_live_quotes_flag(self):
-        today = server.eastern_now().date()
-        e1 = int(dt.datetime.combine(today + dt.timedelta(days=30), dt.time(12), tzinfo=dt.timezone.utc).timestamp())
+        c = self.run_chain([self.stamp(7)], [{"strike": 20.0, "bid": 0, "ask": 0}], price=21.0)
+        self.assertFalse(c["live_quotes"])
 
-        def fake(url):
-            if "date=" in url:
-                return {"optionChain": {"result": [{"options": [{"puts": [{"strike": 20.0, "bid": 0, "ask": 0}]}]}]}}
-            return {"optionChain": {"result": [{"quote": {"regularMarketPrice": 21.0}, "expirationDates": [e1]}]}}
-        orig = server.crumb_json; server.crumb_json = fake
+    def test_no_expiries_is_an_error(self):
+        with self.assertRaises(RuntimeError):
+            self.run_chain([self.stamp(-2)], [])
+
+
+class Movers(unittest.TestCase):
+    def row(self, sym, reg=100.0, rt=1000, post=None, pot=None, pre=None, pt=None, day=0.5, earn=None, vol=2_000_000):
+        return {"symbol": sym, "shortName": sym + " Inc", "regularMarketPrice": reg, "regularMarketTime": rt, "postMarketPrice": post, "postMarketTime": pot,
+                "preMarketPrice": pre, "preMarketTime": pt, "regularMarketChangePercent": day, "earningsTimestamp": earn, "regularMarketVolume": vol}
+
+    def test_after_hours_move_is_measured_from_the_close(self):
+        r = server.mover_row(self.row("AMZN", reg=243.79, post=225.99, pot=2000, day=1.0), {})
+        self.assertEqual((r["ses"], r["p"], r["close"]), ("post", 225.99, 243.79))
+        self.assertEqual(r["move"], round((225.99 / 243.79 - 1) * 100, 2))
+
+    def test_during_the_day_the_move_is_the_day_change(self):
+        r = server.mover_row(self.row("X", day=4.2), {})
+        self.assertEqual((r["ses"], r["move"]), ("reg", 4.2))
+
+    def test_stale_extended_price_before_the_regular_time_is_ignored(self):
+        r = server.mover_row(self.row("X", rt=5000, post=90.0, pot=4000, day=1.5), {})
+        self.assertEqual((r["ses"], r["move"]), ("reg", 1.5))
+
+    def test_no_price_returns_none(self):
+        self.assertIsNone(server.mover_row({"symbol": "X"}, {}))
+
+    def test_earnings_timing_in_new_york(self):
+        utc = dt.timezone.utc
+        after = int(dt.datetime(2026, 10, 29, 20, 5, tzinfo=utc).timestamp())    # 4:05 pm ET
+        before = int(dt.datetime(2026, 10, 29, 11, 30, tzinfo=utc).timestamp())  # 7:30 am ET
+        during = int(dt.datetime(2026, 10, 29, 16, 0, tzinfo=utc).timestamp())   # noon ET
+        self.assertEqual(server.et_date_and_when(after), ("2026-10-29", "post"))
+        self.assertEqual(server.et_date_and_when(before), ("2026-10-29", "pre"))
+        self.assertEqual(server.et_date_and_when(during), ("2026-10-29", ""))
+        self.assertEqual(server.et_date_and_when(None), (None, ""))
+
+    def test_get_movers_ranks_by_size_and_builds_list_first(self):
+        tmp = tempfile.mkdtemp(); old = server.DATA; server.DATA = Path(tmp); server._cache.clear()
+        orig_raw, orig_build = server.raw_batch, server.build_liquid
         try:
-            self.assertFalse(server.fetch_chain("KEY", 14, 60)["live_quotes"])
+            server.build_liquid = lambda: None
+            first = server.get_movers()
+            self.assertTrue(first["building"]); self.assertEqual(first["rows"], [])
+            (Path(tmp) / "liquid.json").write_text(json.dumps({"at": "x", "symbols": ["AAA", "BBB", "CCC"], "names": {"AAA": "Alpha"}}))
+            server.raw_batch = lambda syms: [self.row("AAA", post=110.0, pot=2000), self.row("BBB", post=70.0, pot=2000), self.row("CCC", post=101.0, pot=2000)]
+            server._cache.clear()
+            out = server.get_movers()
+            self.assertEqual([r["s"] for r in out["rows"]], ["BBB", "AAA"])      # CCC moved 1%: under the 2% floor
+            self.assertEqual(out["rows"][1]["n"], "Alpha")
         finally:
-            server.crumb_json = orig
+            server.raw_batch, server.build_liquid, server.DATA = orig_raw, orig_build, old
+            server._cache.clear()
+
+
+class Lookup(unittest.TestCase):
+    def test_explains_why_a_stock_does_not_match(self):
+        closes = [100.0 + (i % 5) * 0.1 for i in range(60)]
+        stamps = [1_700_000_000 + 86400 * i for i in range(60)]
+        orig, orig_e = server.http_json, server.fetch_earnings
+        server.http_json = lambda url, **k: {"chart": {"result": [{"meta": {"longName": "Test Co"}, "timestamp": stamps, "indicators": {"quote": [{"close": closes}]}}]}}
+        server.fetch_earnings = lambda syms: {syms[0]: {"earn": "2026-10-29", "div": 0}}
+        try:
+            d = server.lookup("TEST")
+        finally:
+            server.http_json, server.fetch_earnings = orig, orig_e
+        self.assertEqual(d["name"], "Test Co"); self.assertEqual(d["earn"], "2026-10-29")
+        self.assertEqual({c["k"] for c in d["checks"]}, {"breakout_20d", "reclaim_ma20", "bull_flag", "oversold", "oversold_bounce"})
+        self.assertTrue(all(isinstance(c["why"], str) and c["why"] for c in d["checks"]))
+        self.assertEqual(d["setups"], [c["k"] for c in d["checks"] if c["match"]])
+
+    def test_a_real_breakout_is_reported(self):
+        closes = [100.0] * 40 + [100.0 + i for i in range(1, 21)]            # steady, then a run to new highs
+        stamps = [1_700_000_000 + 86400 * i for i in range(60)]
+        orig = server.http_json
+        server.http_json = lambda url, **k: {"chart": {"result": [{"meta": {}, "timestamp": stamps, "indicators": {"quote": [{"close": closes}]}}]}}
+        orig_e = server.fetch_earnings; server.fetch_earnings = lambda syms: {}
+        try:
+            d = server.lookup("UP")
+        finally:
+            server.http_json, server.fetch_earnings = orig, orig_e
+        self.assertIn("breakout_20d", d["setups"]); self.assertTrue(next(c for c in d["checks"] if c["k"] == "breakout_20d")["match"])
+
+    def test_too_little_history_is_an_error(self):
+        orig = server.http_json
+        server.http_json = lambda url, **k: {"chart": {"result": [{"meta": {}, "timestamp": [1, 2, 3], "indicators": {"quote": [{"close": [1.0, 2.0, 3.0]}]}}]}}
+        try:
+            with self.assertRaises(RuntimeError):
+                server.lookup("NEW")
+        finally:
+            server.http_json = orig
+
+
+class News(unittest.TestCase):
+    def test_force_refresh_is_rate_limited_and_flagged(self):
+        tmp = tempfile.mkdtemp(); old, orig = server.DATA, server.refresh_news
+        server.DATA = Path(tmp); server._cache.clear()
+        calls = []
+        server.refresh_news = lambda: calls.append(1)
+        try:
+            (Path(tmp) / "news.json").write_text(json.dumps({"checked": "x", "items": [], "moves": {}}))
+            fresh = server.get_news(force=True)             # file is seconds old: forced refresh is ignored
+            self.assertFalse(fresh["refreshing"]); time.sleep(0.1); self.assertEqual(calls, [])
+            os.utime(Path(tmp) / "news.json", (time.time() - 120, time.time() - 120))
+            forced = server.get_news(force=True)            # two minutes old: allowed
+            self.assertTrue(forced["refreshing"]); time.sleep(0.3); self.assertEqual(len(calls), 1)
+            os.utime(Path(tmp) / "news.json", (time.time() - 400, time.time() - 400))
+            server._cache.clear(); self.assertTrue(server.get_news()["refreshing"])   # older than 5 minutes refreshes on its own
+        finally:
+            server.DATA, server.refresh_news = old, orig
+            server._cache.clear()
+
+    def test_market_headline_sources_are_always_watched(self):
+        self.assertIn("SPY", server.watch_set()); self.assertIn("QQQ", server.watch_set())
 
 
 class Http(unittest.TestCase):
@@ -162,9 +365,12 @@ class Http(unittest.TestCase):
         cls.port = cls.srv.server_address[1]
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         server.http_json = lambda url, **k: chart([20.0, 21.0], prev=20.0)
+        cls._crumb = server.crumb_json
+        server.crumb_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no batch in tests"))
 
     @classmethod
     def tearDownClass(cls):
+        server.crumb_json = cls._crumb
         cls.srv.shutdown()
         os.environ.pop("DESK_PASSWORD", None)
 
@@ -194,6 +400,29 @@ class Http(unittest.TestCase):
             self.assertEqual(self.req(bad)[0], 404, bad)
         s, body, h = self.req("/lib.js")
         self.assertEqual(s, 200); self.assertIn(b"TraderLib", body); self.assertIn("javascript", h["Content-Type"])
+
+    def test_gzip_and_etag(self):
+        def get(path, headers):
+            r = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path))
+            r.add_header("Authorization", "Basic " + base64.b64encode(b"me:s3cret-pw").decode())
+            for k, v in headers.items():
+                r.add_header(k, v)
+            try:
+                with urllib.request.urlopen(r, timeout=10) as resp:
+                    return resp.status, resp.read(), resp.headers
+            except urllib.error.HTTPError as e:
+                return e.code, e.read(), e.headers
+        plain = get("/api/scan", {})[1]
+        s, zipped, h = get("/api/scan", {"Accept-Encoding": "gzip"})
+        self.assertEqual(h["Content-Encoding"], "gzip"); self.assertLess(len(zipped), len(plain) / 2)
+        self.assertEqual(gzip.decompress(zipped), plain)
+        self.assertNotIn("Content-Encoding", get("/api/scan", {})[2])
+        s, body, h = get("/lib.js", {"Accept-Encoding": "gzip"})
+        etag = h["ETag"]; self.assertTrue(etag); self.assertEqual(h["Cache-Control"], "no-cache")
+        s2, body2, h2 = get("/lib.js", {"If-None-Match": etag, "Accept-Encoding": "gzip"})
+        self.assertEqual(s2, 304); self.assertEqual(body2, b"")
+        self.assertNotEqual(get("/lib.js", {"If-None-Match": '"stale"'})[0], 304)
+        self.assertEqual(get("/api/scan", {})[2]["Cache-Control"], "no-store")
 
     def test_security_headers(self):
         _, _, h = self.req("/api/scan")

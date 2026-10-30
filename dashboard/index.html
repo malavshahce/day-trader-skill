@@ -151,6 +151,15 @@ input:invalid, input.bad { border-color: var(--bad); }
 .bub.u { background: var(--accent-soft); justify-self: end; max-width: 92%; }
 .bub.a { background: var(--surface); border: 1px solid var(--line); }
 .empty { padding: 28px 12px; text-align: center; color: var(--muted); }
+.hint { font-size: 11px; color: var(--muted); }
+details.how { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; background: var(--surface2); margin-bottom: 12px; }
+details.how summary { cursor: pointer; font-weight: 600; }
+details.how ol { margin: 8px 0 0; padding-left: 20px; display: grid; gap: 4px; }
+.step { font-family: var(--mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; grid-column: 1 / -1; margin-top: 4px; }
+.words { font-size: 15px; line-height: 1.6; padding: 12px 14px; background: var(--accent-soft); border-radius: 6px; margin-bottom: 12px; }
+.next { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 4px; }
+.doc h3 { margin-top: 18px; } .doc p, .doc li { max-width: 72ch; } .doc ul, .doc ol { padding-left: 20px; display: grid; gap: 4px; margin: 8px 0; }
+.doc dt { font-weight: 600; margin-top: 8px; } .doc dd { margin: 0; color: var(--muted); max-width: 72ch; }
 .foot { font-size: 12px; color: var(--muted); margin-top: 8px; }
 @media (max-width: 560px) { .hide-s { display: none; } .big { font-size: 24px; } }
 @media (prefers-reduced-motion: no-preference) { .tab, .btn, .chip { transition: border-color .12s, background-color .12s, color .12s; } }
@@ -379,17 +388,17 @@ input:invalid, input.bad { border-color: var(--bad); }
     if (!(px > 0)) return { error: "Enter the stock price." };
     if (!(k > 0)) return { error: "Enter the strike." };
     if (!(prem > 0)) return { error: "Enter the premium you would receive per share." };
-    if (!(dte > 0)) return { error: "Enter days to expiry." };
+    if (!(dte >= 0)) return { error: "Enter days to expiry (0 for a same-day expiry)." };
     if (prem >= k) return { error: "The premium cannot be as large as the strike." };
     var cash = k * 100;
     var credit = prem * 100;
     var breakeven = k - prem;
     var retPct = prem / (k - prem) * 100;           // return on cash actually tied up (strike less premium)
-    var ann = retPct * 365 / dte;
+    var ann = dte > 0 ? retPct * 365 / dte : null;   // a same-day expiry has no meaningful annual rate
     var otm = (px - k) / px * 100;
     var out = {
       cashPerContract: cash, creditPerContract: credit, breakeven: breakeven,
-      returnPct: retPct, annualizedPct: ann, otmPct: otm,
+      returnPct: retPct, annualizedPct: ann, otmPct: otm, dte: dte,
       worstCase: (k - prem) * 100,                  // stock to zero
       loss20: (k - prem) * 100 * 0.20               // options-strategist sizing rule: 20% adverse move
     };
@@ -456,7 +465,7 @@ input:invalid, input.bad { border-color: var(--bad); }
 (function () {
   "use strict";
   var L = window.TraderLib;
-  var TABS = [["today", "Today"], ["scanner", "Scanner"], ["planner", "Planner"], ["options", "Options"], ["news", "News"], ["journal", "Journal"], ["ask", "Ask Claude"], ["settings", "Settings"]];
+  var TABS = [["today", "Today"], ["scanner", "Scanner"], ["planner", "Planner"], ["options", "Options"], ["news", "News"], ["journal", "Journal"], ["ask", "Ask Claude"], ["guide", "Guide"], ["settings", "Settings"]];
   var CFG_FIELDS = [
     ["budget", "Account budget ($)", "number"], ["max_loss_per_trade_usd", "Max loss per trade ($)", "number"],
     ["max_daily_loss_usd", "Daily loss limit ($)", "number"], ["max_trades_per_day", "Trades per day", "number"],
@@ -473,6 +482,7 @@ input:invalid, input.bad { border-color: var(--bad); }
     journal: [], store: "local", dbNote: "", settingsErr: "",
     drawer: null, ctxSym: null, chat: [], chatBusy: false, chatCtl: null, chatNote: "", sampleOK: null
   };
+  var IS_WEB = false;
   var db = null, sample = null, unsubs = [], writeQ = Promise.resolve(), base = null, jcoll = null;
 
   /* ---------------- helpers ---------------- */
@@ -497,6 +507,9 @@ input:invalid, input.bad { border-color: var(--bad); }
     return Math.round((u(b) - u(a)) / 86400000);
   }
   function today() { return L.nyParts(new Date()).date; }
+  function addDays(ymd, n) {   // calendar days, so a clock change never moves the date
+    var p = ymd.split("-"); return new Date(Date.UTC(+p[0], +p[1] - 1, +p[2] + n)).toISOString().slice(0, 10);
+  }
   function setupName(k) { return L.SETUPS[k] || k; }
   function N(id) { var e = document.getElementById(id); return e ? e.value : ""; }
   function fitMax() { var c = S.cfg; return Math.min(L.num(c.budget) * L.num(c.max_position_pct) / 100, L.num(c.max_order_usd) || Infinity); }
@@ -577,7 +590,7 @@ input:invalid, input.bad { border-color: var(--bad); }
     renderTabs();
     var v = $("#view");
     if (S.loadErr && !S.scan) { v.innerHTML = '<div class="card"><h3>Data did not load</h3><p class="muted">' + esc(S.loadErr) + '</p><p style="margin-top:10px"><button class="btn p" data-act="reload">Try again</button></p></div>'; return; }
-    var fn = { today: vToday, scanner: vScanner, planner: vPlanner, options: vOptions, news: vNews, journal: vJournal, ask: vAsk, settings: vSettings }[S.tab];
+    var fn = { today: vToday, scanner: vScanner, planner: vPlanner, options: vOptions, news: vNews, journal: vJournal, ask: vAsk, guide: vGuide, settings: vSettings }[S.tab];
     v.innerHTML = fn();
     afterRender();
     renderDrawer();
@@ -690,24 +703,42 @@ input:invalid, input.bad { border-color: var(--bad); }
     var x = $("#drawer-x"); if (x) x.focus();
   }
   function newsItem(i) {
-    return '<div class="item"><a href="' + esc(safeUrl(i.u)) + '" target="_blank" rel="noopener noreferrer">' + esc(i.h) + '</a><div class="row small muted"><span>' + esc(fmtET(i.t)) + "</span><span>" + esc(i.src) + "</span>" + (i.k === "filing" ? '<span class="tag s">SEC filing</span>' : "") + (i.tags || []).map(function (t) { return '<span class="tag">' + esc(t) + "</span>"; }).join("") + "</div></div>";
+    return '<div class="item"><a href="' + esc(safeUrl(i.u)) + '" target="_blank" rel="noopener noreferrer">' + esc(i.h) + '</a><div class="row small muted"><span><b>' + esc(ago(i.t)) + "</b></span><span>" + esc(fmtET(i.t)) + "</span><span>" + esc(i.src) + "</span>" + (i.k === "filing" ? '<span class="tag s">SEC filing</span>' : "") + (i.tags || []).map(function (t) { return '<span class="tag">' + esc(t) + "</span>"; }).join("") + "</div></div>";
   }
 
   /* ---------------- Planner ---------------- */
-  function pin(id, label, val, attrs) { return '<label class="f">' + label + '<input id="' + id + '" class="num" inputmode="decimal" autocomplete="off" value="' + esc(val) + '" ' + (attrs || "") + "></label>"; }
+  function pin(id, label, val, attrs, hint) { return '<label class="f">' + label + '<input id="' + id + '" class="num" inputmode="decimal" autocomplete="off" value="' + esc(val) + '" ' + (attrs || "") + ">" + (hint ? '<span class="hint">' + hint + "</span>" : "") + "</label>"; }
+  function ago(iso) {
+    var m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+    if (!isFinite(m)) return "";
+    if (m < 1) return "just now"; if (m < 60) return m + "m ago"; if (m < 2880) return Math.round(m / 60) + "h ago"; return Math.round(m / 1440) + "d ago";
+  }
+  function shortlist(n) {
+    return L.filterScan(S.scan.hits, { maxPrice: fitMax(), minVolume: 2e6 }).filter(function (r) { return r[5].indexOf("breakout_20d") !== -1 || r[5].indexOf("bull_flag") !== -1; }).slice(0, n);
+  }
+  function startPlan(v) {
+    var r = scanMap()[v]; S.plan = { symbol: v, entry: r ? r[2].toFixed(2) : "", stopRule: "pct", orHigh: "", orLow: "", stopParam: "2", atr: "", targetRule: "r", targetParam: "2", example: false };
+    go("planner");
+  }
   function vPlanner() {
-    var p = S.plan, ts = todayStats();
-    var h = '<div class="grid g2"><section class="card"><div class="head"><h2>Trade planner</h2><span class="src">Long side · same maths as trader-exit, budget, risk</span></div>';
+    var p = S.plan, ts = todayStats(), sl = shortlist(12), c = S.cfg;
+    var h = '<div class="grid g2"><section class="card"><div class="head"><h2>Trade planner</h2><span class="src">Long side only · plans a trade, never places one</span></div>';
+    h += '<details class="how" id="p-help"' + (lsGet("td.planhelp") === "0" ? "" : " open") + '><summary>How to use this in 30 seconds</summary><ol><li><b>Pick a stock</b> and its entry price (the price you expect to pay).</li><li><b>Choose a stop</b>: the price where you admit you were wrong and sell.</li><li><b>Choose a target</b>: where you take profit. "2" means you aim to win twice what you risk.</li><li>Read <b>Your plan in words</b> on the right. <b>PASS</b> means every one of your rules is met. <b>BLOCK</b> means something failed, and the list says what to change.</li></ol></details>';
     if (p.example) h += '<div class="note info" style="margin-bottom:12px">Example inputs: Tesla on Oct 19, 2026 from the skill\'s walkthrough. Overwrite them with your trade.</div>';
-    h += '<div class="form"><label class="f">Symbol<input id="p-symbol" value="' + esc(p.symbol) + '" autocomplete="off" maxlength="8"></label>' + pin("p-entry", "Entry price ($)", p.entry);
-    h += '<label class="f">Stop rule<select id="p-stopRule">' + [["or_mid", "Opening-range midpoint"], ["or_low", "Opening-range low"], ["price", "My price"], ["pct", "% under entry"], ["atr", "ATR multiple"]].map(function (o) { return '<option value="' + o[0] + '"' + (p.stopRule === o[0] ? " selected" : "") + ">" + o[1] + "</option>"; }).join("") + "</select></label>";
-    if (p.stopRule === "or_mid" || p.stopRule === "or_low") h += pin("p-orHigh", "Range high ($)", p.orHigh) + pin("p-orLow", "Range low ($)", p.orLow);
-    else if (p.stopRule === "price") h += pin("p-stopParam", "Stop price ($)", p.stopParam);
-    else if (p.stopRule === "pct") h += pin("p-stopParam", "Percent under entry", p.stopParam);
-    else h += pin("p-atr", "ATR value ($)", p.atr) + pin("p-stopParam", "ATR multiple", p.stopParam);
-    h += '<label class="f">Target<select id="p-targetRule"><option value="r"' + (p.targetRule === "r" ? " selected" : "") + '>Multiple of risk (R)</option><option value="price"' + (p.targetRule === "price" ? " selected" : "") + ">My price</option></select></label>";
-    h += pin("p-targetParam", p.targetRule === "r" ? "Target (R)" : "Target price ($)", p.targetParam) + "</div>";
-    h += '<p class="foot">Today you have logged ' + ts.trades + " trade(s) and " + L.money(ts.risked) + " of risk. Limits come from Settings.</p></section>";
+    h += '<div class="form"><span class="step">Step 1 · The stock</span>';
+    h += '<label class="f wide">Start from today\'s shortlist<select id="p-pick"><option value="">Pick a stock…</option>' + sl.map(function (r) { return '<option value="' + esc(r[0]) + '">' + esc(r[0]) + " · " + r[2].toFixed(2) + " · " + esc(r[5].map(setupName).join(", ")) + "</option>"; }).join("") + "</select></label>";
+    h += '<label class="f">Symbol<input id="p-symbol" value="' + esc(p.symbol) + '" autocomplete="off" maxlength="8"></label>' + pin("p-entry", "Entry price ($)", p.entry, "", IS_WEB ? "Fills in from the live price" : "The price you expect to pay");
+    h += '<span class="step">Step 2 · Your stop (where you get out if wrong)</span>';
+    h += '<label class="f">Stop type<select id="p-stopRule">' + [["pct", "A % below my entry (simple)"], ["or_mid", "Opening-range midpoint (after 9:45 ET)"], ["or_low", "Opening-range low (after 9:45 ET)"], ["price", "A price I choose"], ["atr", "Based on daily swing size (ATR)"]].map(function (o) { return '<option value="' + o[0] + '"' + (p.stopRule === o[0] ? " selected" : "") + ">" + o[1] + "</option>"; }).join("") + "</select></label>";
+    if (p.stopRule === "or_mid" || p.stopRule === "or_low") h += pin("p-orHigh", "Range high ($)", p.orHigh, "", "Highest price in the first 15 minutes") + pin("p-orLow", "Range low ($)", p.orLow, "", "Lowest price in the first 15 minutes");
+    else if (p.stopRule === "price") h += pin("p-stopParam", "Stop price ($)", p.stopParam, "", "Below your entry");
+    else if (p.stopRule === "pct") h += pin("p-stopParam", "Percent under entry", p.stopParam, "", "2 means sell if it drops 2%");
+    else h += pin("p-atr", "ATR value ($)", p.atr, "", "Typical daily move, from your broker") + pin("p-stopParam", "ATR multiple", p.stopParam, "", "1.5 is common");
+    h += '<span class="step">Step 3 · Your target (where you take profit)</span>';
+    h += '<label class="f">Target type<select id="p-targetRule"><option value="r"' + (p.targetRule === "r" ? " selected" : "") + '>Multiple of my risk (R)</option><option value="price"' + (p.targetRule === "price" ? " selected" : "") + ">A price I choose</option></select></label>";
+    h += pin("p-targetParam", p.targetRule === "r" ? "Target (R)" : "Target price ($)", p.targetParam, "", p.targetRule === "r" ? "2 = aim to win 2x what you risk" : "Above your entry") + "</div>";
+    h += '<p class="foot">Your rules: risk at most ' + L.money(L.num(c.max_loss_per_trade_usd), 0) + " per trade and " + L.money(L.num(c.max_daily_loss_usd), 0) + " a day, " + esc(c.max_trades_per_day) + " trades a day, entries " + esc(c.no_entries_before) + "–" + esc(c.no_entries_after) + " ET. Change them in Settings.</p>";
+    h += '<div id="p-live" class="row" style="margin-top:10px"></div><p class="foot">Today you have logged ' + ts.trades + " trade(s) and " + L.money(ts.risked) + " of risk.</p></section>";
     h += '<section class="card" id="p-out"></section></div>';
     return h;
   }
@@ -723,12 +754,31 @@ input:invalid, input.bad { border-color: var(--bad); }
     var rc = L.riskCheck(pl, sz, S.cfg, { riskedToday: ts.risked, tradesToday: ts.trades, nowET: m.time, marketOpen: m.open });
     return { plan: pl, size: sz, risk: rc };
   }
+  var FIX = {
+    "Plan valid": "Fix the inputs on the left.",
+    "Size is at least 1 share": "Use a tighter stop or a cheaper stock. One share already risks more than your limit.",
+    "Loss at stop within max per trade": "Use a tighter stop, or accept fewer shares.",
+    "Reward:risk meets minimum": "Raise the target or tighten the stop so the possible gain beats the possible loss.",
+    "Daily loss limit": "You have already risked a lot today. Wait for tomorrow, or close a logged trade first.",
+    "Trades per day": "You have used today's trades. Stop for the day.",
+    "Market open": "The market is closed. Treat this as a plan for the next open.",
+    "Inside entry window": "Wait for your entry window (Settings), or skip this trade."
+  };
+  function planWords(pl, sz, sym) {
+    if (sz.qty < 1) return '<div class="words">This trade does not fit your rules. ' + esc(sz.refusal || "") + "</div>";
+    return '<div class="words"><b>Your plan in words.</b> Buy <b>' + sz.qty + "</b> share" + (sz.qty === 1 ? "" : "s") + " of <b>" + esc(sym) + "</b> at about <b>" + L.money(pl.entry) + "</b> (it costs " + L.money(sz.cost) + "). If it falls to <b>" + L.money(pl.stop) + '</b>, sell: you lose about <b class="down">' + L.money(sz.maxLoss) + '</b>. If it rises to <b>' + L.money(pl.target) + '</b>, sell: you make about <b class="up">' + L.money(sz.maxReward) + "</b>.</div>";
+  }
+  function planNext(rc) {
+    var bad = rc.checks.filter(function (k) { return !k.ok; });
+    if (!bad.length) return '<h3 style="margin-top:14px">What to do next</h3><ul class="next"><li>Every rule is met. This is a plan, not an order.</li><li>Place it yourself in your broker, in a <b>paper</b> account first, as a bracket order: buy, with the stop and the target attached.</li><li>Log it below so your daily limits stay accurate.</li></ul>';
+    return '<h3 style="margin-top:14px">What to change</h3><ul class="next">' + bad.map(function (k) { return "<li><b>" + esc(k.name) + ".</b> " + esc(FIX[k.name] || k.detail) + "</li>"; }).join("") + "</ul>";
+  }
   function updatePlanner() {
     var out = $("#p-out"); if (!out) return;
     var c = planCalc(), p = S.plan;
     if (c.error) { out.innerHTML = '<h3>Plan</h3><div class="note bad" style="margin-top:8px">' + esc(c.error) + "</div>"; return; }
     var pl = c.plan, sz = c.size, rc = c.risk, sym = (p.symbol || "SYMBOL").toUpperCase().replace(/[^A-Z.\-]/g, "");
-    var h = '<div class="head"><h2>Result</h2><span class="verdict ' + rc.verdict + '">' + rc.verdict + "</span></div>";
+    var h = '<div class="head"><h2>Result</h2><span class="verdict ' + rc.verdict + '" title="PASS: every rule is met. BLOCK: at least one rule failed.">' + rc.verdict + "</span></div>" + planWords(pl, sz, sym);
     h += '<div class="tiles"><div class="tile"><div class="k">Stop</div><div class="v">' + pl.stop.toFixed(2) + '</div><div class="d muted">' + esc(pl.stopLabel) + '</div></div><div class="tile"><div class="k">Target</div><div class="v">' + pl.target.toFixed(2) + '</div><div class="d muted">' + esc(pl.targetLabel) + ' · ' + pl.rr.toFixed(2) + ' : 1</div></div><div class="tile"><div class="k">Shares</div><div class="v">' + sz.qty + '</div><div class="d muted">' + L.money(sz.cost) + ' · ' + sz.pctOfBudget + "% of budget</div></div></div>";
     h += '<dl class="kv" style="margin-top:12px"><dt>Risk per share</dt><dd>' + L.money(pl.risk) + "</dd><dt>Loss if stopped</dt><dd class=\"down\">" + L.money(sz.maxLoss) + "</dd><dt>Gain at target</dt><dd class=\"up\">" + L.money(sz.maxReward) + "</dd><dt>Size decided by</dt><dd>" + esc(sz.boundBy) + "</dd></dl>";
     if (sz.refusal) h += '<div class="note bad" style="margin-top:10px">' + esc(sz.refusal) + "</div>";
@@ -737,6 +787,7 @@ input:invalid, input.bad { border-color: var(--bad); }
       return '<div class="limit' + (l.binds ? " binds" : "") + '"><div class="row" style="justify-content:space-between"><span>' + esc(l.name) + (l.binds ? ' <span class="tag">decides</span>' : "") + '</span><span class="num">' + l.shares + ' sh</span></div><div class="small muted">' + esc(l.how) + '</div><div class="bar"><span style="width:' + pct.toFixed(0) + '%"></span></div></div>';
     }).join("");
     h += '<h3 style="margin-top:14px">Risk check</h3><ul class="checks">' + rc.checks.map(function (k) { return '<li><span class="' + (k.ok ? "ok" : "no") + '">' + (k.ok ? "✓" : "✕") + "</span><span>" + esc(k.name) + ' <span class="muted">· ' + esc(k.detail) + "</span></span></li>"; }).join("") + "</ul>";
+    h += planNext(rc);
     var ticket = sz.qty > 0 ? "PAPER TICKET (not sent)\nBUY " + sz.qty + " " + sym + " @ " + pl.entry.toFixed(2) + " limit\n  stop-loss    " + pl.stop.toFixed(2) + "\n  take-profit  " + pl.target.toFixed(2) + "\n  max loss     " + L.money(sz.maxLoss) + "\n  flat by      " + S.cfg.flat_by + " ET" : "No ticket: size is 0 shares.";
     h += '<h3 style="margin-top:14px">Ticket</h3><div class="ticket" id="p-ticket">' + esc(ticket) + "</div>";
     h += '<div class="row" style="margin-top:10px"><button class="btn sm" data-act="copy" data-v="p-ticket">Copy ticket</button><button class="btn sm p" data-act="logplan"' + (sz.qty > 0 ? "" : " disabled") + ">Log to journal</button><button class=\"btn sm\" data-act=\"askplan\">Ask Claude to review</button></div>";
@@ -751,11 +802,12 @@ input:invalid, input.bad { border-color: var(--bad); }
     if (c.example) h += '<div class="note info" style="margin-bottom:12px">Example inputs. The premium is a placeholder, not a quote. Copy the real bid/mid from your broker.</div>';
     h += '<div class="form"><label class="f">Symbol<input id="c-symbol" value="' + esc(c.symbol) + '" maxlength="8" autocomplete="off"></label>' + pin("c-price", "Stock price ($)", c.price) + pin("c-strike", "Strike ($)", c.strike) + pin("c-premium", "Premium per share ($)", c.premium);
     h += '<label class="f">Expiry<input id="c-expiry" type="date" value="' + esc(c.expiry) + '"></label>' + pin("c-account", "Account ($)", c.account, 'placeholder="' + esc(S.cfg.budget) + '"') + pin("c-riskPct", "Risk per trade (%)", c.riskPct) + "</div>";
+    h += '<div class="row" style="margin-top:12px" id="c-dtes"><span class="muted small">Quick expiry:</span>' + [[0, "0 DTE (today)"], [4, "4"], [5, "5"], [7, "7"], [14, "14"], [21, "21"], [30, "30"], [45, "45"], [60, "60"], [90, "90"], [180, "180"], [365, "1 year"]].map(function (d) { return '<button class="chip" data-act="dte" data-v="' + d[0] + '" aria-pressed="false">' + d[1] + "</button>"; }).join("") + '<span class="muted small">days to expiry, approximate date</span></div>';
     h += '<p class="foot">Sizing rule: risk = (strike − premium) × 100 × 20% move, from the options-strategist skill. Premium and delta must come from a live chain.</p></section><section class="card" id="c-out"></section></div>';
     return h;
   }
   function cspDefaults() {
-    if (!S.csp.expiry) { var d = new Date(Date.now() + 36 * 86400000); S.csp.expiry = L.nyParts(d).date; }
+    if (!S.csp.expiry) S.csp.expiry = addDays(today(), 36);
   }
   function readCsp() { var c = S.csp; ["symbol", "price", "strike", "premium", "expiry", "account", "riskPct"].forEach(function (k) { var e = document.getElementById("c-" + k); if (e) c[k] = e.value; }); }
   function updateCsp() {
@@ -763,12 +815,14 @@ input:invalid, input.bad { border-color: var(--bad); }
     var c = S.csp, sym = (c.symbol || "").toUpperCase(), td = today();
     var dte = /^\d{4}-\d{2}-\d{2}$/.test(c.expiry) ? dayDiff(td, c.expiry) : NaN;
     var acct = L.num(c.account); if (!(acct > 0)) acct = L.num(S.cfg.budget);
-    var r = isFinite(dte) && dte <= 0 ? { error: "Pick an expiry date after today." } : L.cspCalc({ price: c.price, strike: c.strike, premium: c.premium, dte: dte, account: acct, riskPct: c.riskPct });
+    var r = isFinite(dte) && dte < 0 ? { error: "Pick an expiry date today or later." } : L.cspCalc({ price: c.price, strike: c.strike, premium: c.premium, dte: dte, account: acct, riskPct: c.riskPct });
     if (r.error) { out.innerHTML = '<h3>Result</h3><div class="note bad" style="margin-top:8px">' + esc(r.error) + "</div>"; return; }
-    var h = '<div class="head"><h2>Result</h2><span class="pill acc">' + dte + " days</span></div>";
+    var h = '<div class="head"><h2>Result</h2><span class="pill acc">' + (dte === 0 ? "Expires today" : dte + " days") + "</span></div>";
     h += '<div class="tiles"><div class="tile"><div class="k">Cash tied up</div><div class="v">' + L.money(r.cashPerContract, 0) + '</div><div class="d muted">' + r.pctOfAccount.toFixed(0) + "% of " + L.money(acct, 0) + '</div></div><div class="tile"><div class="k">Credit</div><div class="v">' + L.money(r.creditPerContract, 0) + '</div><div class="d muted">per contract</div></div><div class="tile"><div class="k">Breakeven</div><div class="v">' + r.breakeven.toFixed(2) + '</div><div class="d muted">' + r.otmPct.toFixed(1) + "% below price</div></div></div>";
-    h += '<dl class="kv" style="margin-top:12px"><dt>Return if it expires worthless</dt><dd>' + r.returnPct.toFixed(2) + "%</dd><dt>Annualized</dt><dd>" + r.annualizedPct.toFixed(1) + "%</dd><dt>Loss on a 20% drop</dt><dd class=\"down\">" + L.money(r.loss20, 0) + "</dd><dt>Worst case (stock to zero)</dt><dd class=\"down\">" + L.money(r.worstCase, 0) + "</dd><dt>Contracts that fit the cash</dt><dd>" + r.fitsAccount + "</dd><dt>Contracts at " + esc(c.riskPct) + "% risk</dt><dd>" + (r.contractsByRisk === undefined ? "–" : r.contractsByRisk) + "</dd><dt>Suggested contracts</dt><dd><strong>" + r.contracts + "</strong></dd></dl>";
+    h += '<dl class="kv" style="margin-top:12px"><dt>Return if it expires worthless</dt><dd>' + r.returnPct.toFixed(2) + "%</dd><dt>Annualized</dt><dd>" + (r.annualizedPct === null ? "n/a (same day)" : r.annualizedPct.toFixed(1) + "%") + "</dd><dt>Loss on a 20% drop</dt><dd class=\"down\">" + L.money(r.loss20, 0) + "</dd><dt>Worst case (stock to zero)</dt><dd class=\"down\">" + L.money(r.worstCase, 0) + "</dd><dt>Contracts that fit the cash</dt><dd>" + r.fitsAccount + "</dd><dt>Contracts at " + esc(c.riskPct) + "% risk</dt><dd>" + (r.contractsByRisk === undefined ? "–" : r.contractsByRisk) + "</dd><dt>Suggested contracts</dt><dd><strong>" + r.contracts + "</strong></dd></dl>";
     if (r.contracts === 0) h += '<div class="note" style="margin-top:10px">Zero contracts at this risk setting. One contract would put ' + L.money(r.loss20, 0) + " (" + (r.loss20 / acct * 100).toFixed(1) + "% of the account) at risk on a 20% drop. Consider a put spread, a cheaper stock, or a larger account.</div>";
+    if (dte <= 7) h += '<div class="note" style="margin-top:10px">Short-dated puts (0 to 7 days) move fast, and a gap can blow through any stop. Use them only on the most liquid names (SPY, QQQ, mega-caps) and size small.</div>';
+    else if (dte > 180) h += '<p class="foot">Long-dated: your cash is tied up for ' + dte + ' days, so judge it by the annualized return.</p>';
     var ei = earnInfo(sym);
     if (ei && ei.days >= 0 && ei.days <= dte) h += '<div class="note bad" style="margin-top:10px">' + esc(sym) + " reports " + esc(fmtDay(ei.date)) + ", before this expiry. The skill avoids holding through earnings.</div>";
     else if (ei) h += '<p class="foot">' + esc(sym) + " next earnings " + esc(fmtDay(ei.date)) + ", " + (ei.days > dte ? "after" : "already past") + " this expiry.</p>";
@@ -812,6 +866,44 @@ input:invalid, input.bad { border-color: var(--bad); }
       var has = j.exit !== null && j.exit !== undefined && j.exit !== "", d = has ? (L.num(j.exit) - L.num(j.entry)) * L.num(j.qty) : null;
       return "<tr><td>" + esc(fmtDay(j.day)) + '</td><td><span class="sym">' + esc(j.sym) + "</span>" + (j.note ? '<span class="nm">' + esc(j.note) + "</span>" : "") + '</td><td class="r num">' + L.num(j.entry).toFixed(2) + '</td><td class="r num">' + L.num(j.stop).toFixed(2) + '</td><td class="r num hide-s">' + (isFinite(L.num(j.target)) ? L.num(j.target).toFixed(2) : "–") + '</td><td class="r num">' + esc(j.qty) + '</td><td class="r num">' + (has ? L.num(j.exit).toFixed(2) : '<input class="num" style="width:84px;padding:3px 6px" id="x-' + esc(j.id) + '" inputmode="decimal" placeholder="exit"> <button class="btn sm" data-act="jclose" data-v="' + esc(j.id) + '">Close</button>') + '</td><td class="r num ' + (d === null ? "" : cls(d)) + '">' + (d === null ? "open" : L.money(d)) + '</td><td class="r"><button class="btn sm" data-act="jdel" data-v="' + esc(j.id) + '" aria-label="Delete ' + esc(j.sym) + ' trade">Delete</button></td></tr>';
     }).join("") + "</tbody></table></div>" : '<p class="empty">No trades logged yet. Add one above, or log a plan from the Planner tab.</p>') + "</section>";
+    return h;
+  }
+
+  /* ---------------- Guide ---------------- */
+  function vGuide() {
+    var h = '<section class="card doc"><div class="head"><h2>How Trader Desk works</h2><span class="src">Read once, then use the tabs</span></div>';
+    h += "<p>Trader Desk finds stocks worth a look, helps you plan a trade, and checks the plan against your own rules. <b>It never places an order.</b> You make every decision and place every order yourself, in a paper (practice) account first. It is not financial advice.</p>";
+    h += "<h3>A daily routine</h3><ol>";
+    h += "<li><b>Before the open.</b> Today: read the market read, the shortlist and the earnings flags." + (IS_WEB ? " Movers: see who jumped or dropped overnight, especially after earnings." : "") + " News: read the headlines for those names.</li>";
+    h += "<li><b>After 9:45 ET.</b> Pick one stock. On your broker's chart note the highest and lowest price of the first 15 minutes (the opening range). Planner: enter the symbol and choose a stop and a target.</li>";
+    h += "<li><b>Read the result.</b> PASS means all your rules are met. BLOCK lists what to change. If you still like it, place the order yourself with the stop and target attached, and log it in Journal.</li>";
+    h += "<li><b>Before 3:55 PM ET.</b> Close anything still open. This is day trading: flat by the close.</li>";
+    h += "<li><b>After the close.</b> Journal: close each trade with its exit price to see profit or loss and how many R it made.</li></ol>";
+    h += "<h3>Tab by tab</h3><ul>";
+    h += "<li><b>Today.</b> The market in one look, a shortlist of breakouts and flags that fit your account, earnings coming up, and the biggest movers.</li>";
+    h += "<li><b>Scanner.</b> Every chart from the last scan that matches a setup. Search, filter, sort, tap a row for details." + (IS_WEB ? " Use <b>Check any stock</b> to see why a stock does or does not match." : "") + "</li>";
+    if (IS_WEB) h += "<li><b>Movers.</b> The biggest moves right now across about 1,500 liquid stocks: pre-market, after-hours or intraday. Earnings reactions are tagged. The daily scan cannot see these because it only reads regular-session closes.</li>";
+    h += "<li><b>Planner.</b> Turns a stock, a stop and a target into a share count, a loss and a gain, then checks your rules.</li>";
+    h += "<li><b>Options.</b> Cash-secured put calculator. " + (IS_WEB ? "Load the live put chain and pick a strike." : "Type the premium from your broker.") + "</li>";
+    h += "<li><b>News.</b> Latest headlines and SEC filings for the watched stocks and the market (SPY, QQQ), newest first.</li>";
+    h += "<li><b>Journal.</b> Your trades, profit and loss, win rate, and today's trade count and risk, which the Planner uses.</li>";
+    h += "<li><b>Settings.</b> Your account size and limits. Every check uses them.</li></ul>";
+    h += "<h3>Worked example: the Planner</h3><p>Tesla, Oct 19 2026. The first 15 minutes traded between 354.47 and 362.18. At 10:15 the price closed above the range at 364.18, so you plan to buy at 364.18.</p><ul>";
+    h += "<li><b>Stop</b> = middle of the opening range = (362.18 + 354.47) / 2 = 358.325, rounded down to <b>358.32</b>.</li>";
+    h += "<li><b>Risk per share</b> = 364.18 − 358.32 = <b>5.86</b>. This is 1 R.</li>";
+    h += "<li><b>Target at 1 R</b> = 364.18 + 5.86 = <b>370.04</b>. At 2 R it would be 375.90.</li>";
+    h += "<li><b>Shares.</b> Your max loss per trade is $50, so 50 / 5.86 = 8.5, rounded down to <b>8 shares</b>. They cost $2,913.44. If stopped you lose 8 × 5.86 = <b>$46.88</b>.</li>";
+    h += "<li>Four limits are checked (max loss, position cap, max order, cash). The smallest share count wins. Here the max-loss limit decided.</li>";
+    h += "<li>The risk check then asks: is a stop set, is the loss within your limit, is the reward at least your minimum, are you under your daily loss and trade limits, and is it inside your entry window?</li></ul>";
+    h += "<h3>Options: expiry in plain words</h3><ul>";
+    h += "<li><b>0 DTE</b>: expires today. Very fast, big gap risk. Only for the most liquid names, small size.</li>";
+    h += "<li><b>4 or 5 DTE</b>: about a week. <b>7 DTE</b>: next weekly. <b>14 DTE</b>: two weeks.</li>";
+    h += "<li><b>21 to 45 DTE</b>: the usual range for selling puts for income. Time decay works for you, and you have time to react.</li>";
+    h += "<li><b>60 to 180 DTE</b>: slower and less premium per day. <b>Long-dated (LEAPS)</b>: a year or more. Your cash is tied up for a long time, so judge it by the annualized return.</li></ul>";
+    h += "<p>A <b>cash-secured put</b> pays you a premium now. In return you agree to buy 100 shares at the strike if the stock closes below it at expiry, so you keep strike × 100 in cash. Breakeven = strike − premium. Skip a put whose expiry comes after earnings.</p>";
+    h += "<h3>Words you will see</h3><dl>";
+    [["Stop", "The price where you sell to limit a loss."], ["Target", "The price where you sell to take a profit."], ["R", "Your risk on one share (entry − stop). A 2 R target pays twice what you risk."], ["PASS / BLOCK", "PASS: every rule is met. BLOCK: at least one failed."], ["Opening range", "The high and low of the first 15 minutes after the 9:30 ET open."], ["20-day breakout", "A close above the highest close of the last 20 days."], ["Bull flag", "A stock that ran more than 10% and has since moved sideways in a tight range."], ["RSI", "A 0 to 100 gauge of recent strength. Under 30 is called oversold, over 70 overbought."], ["ATR", "The typical size of a daily move."], ["DTE", "Days to expiry of an option."], ["Premium", "The money you receive for selling an option, per share. One contract is 100 shares."], ["Open interest", "How many contracts exist. Low numbers mean it is hard to trade."], ["Spread", "The gap between bid and ask. A wide gap costs you money."], ["IV", "Implied volatility: how big a move the options market expects."]].forEach(function (g) { h += "<dt>" + esc(g[0]) + "</dt><dd>" + esc(g[1]) + "</dd>"; });
+    h += "</dl><h3>What it cannot do</h3><ul><li>It cannot place orders, and it does not know your broker account.</li><li>Prices come from Yahoo for free and can be up to 15 minutes late. Check your broker before acting.</li><li>The scan reads daily closes with fixed rules. A match is a chart to look at, not a stock to buy.</li><li>Most people who day trade lose money. Practice on paper first. Not financial advice.</li></ul></section>";
     return h;
   }
 
@@ -892,6 +984,7 @@ input:invalid, input.bad { border-color: var(--bad); }
     var a = t.getAttribute("data-act"), v = t.getAttribute("data-v");
     if (a === "tab") go(v);
     else if (a === "reload") boot();
+    else if (a === "dte") { S.csp.expiry = addDays(today(), +v); S.csp.example = false; render(); }
     else if (a === "open") { S.drawer = v; S.ctxSym = v; renderDrawer(); }
     else if (a === "close") { S.drawer = null; renderDrawer(); }
     else if (a === "goscan") { S.f.setup = v; S.f.shown = 50; go("scanner"); }
@@ -899,7 +992,7 @@ input:invalid, input.bad { border-color: var(--bad); }
     else if (a === "sort") { if (S.f.sort === v) S.f.dir = S.f.dir === "asc" ? "desc" : "asc"; else { S.f.sort = v; S.f.dir = v === "symbol" ? "asc" : "desc"; } render(); }
     else if (a === "more") { S.f.shown += 50; updateScanBody(); }
     else if (a === "morenews") { S.news_f.shown += 40; updateNews(); }
-    else if (a === "plan") { var r = scanMap()[v]; S.plan = { symbol: v, entry: r ? r[2].toFixed(2) : "", stopRule: "pct", orHigh: "", orLow: "", stopParam: "1", atr: "", targetRule: "r", targetParam: "2", example: false }; go("planner"); }
+    else if (a === "plan") startPlan(v);
     else if (a === "askabout") { go2ask("Explain the " + v + " setup on my shortlist: what the scan shows, what to watch at the open, and what would invalidate it.", v); }
     else if (a === "askplan") go2ask("Review the trade plan currently in the Planner. What are the weak points, and does the stop make sense?");
     else if (a === "askcsp") go2ask("Critique the cash-secured put in the Options calculator: strike distance, size versus my account, earnings, and what could go wrong.");
@@ -936,8 +1029,10 @@ input:invalid, input.bad { border-color: var(--bad); }
     if ((ev.key === "Enter" || ev.key === " ") && ev.target.matches && ev.target.matches("tr.clk")) { ev.preventDefault(); S.drawer = ev.target.getAttribute("data-v"); renderDrawer(); }
     if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target.id === "a-in") { var q = ev.target.value; ev.target.value = ""; ask(q); }
   });
+  document.addEventListener("toggle", function (ev) { if (ev.target && ev.target.id === "p-help") lsSet("td.planhelp", ev.target.open ? "1" : "0"); }, true);
   document.addEventListener("input", function (ev) {
     var id = ev.target.id || "";
+    if (id === "p-pick") { if (ev.target.value) startPlan(ev.target.value); return; }
     if (id.indexOf("p-") === 0) { readPlan(); S.plan.example = false; if (id === "p-stopRule" || id === "p-targetRule") render(); else updatePlanner(); }
     else if (id.indexOf("c-") === 0) { readCsp(); S.csp.example = false; updateCsp(); }
     else if (id === "f-q") { S.f.query = ev.target.value; S.f.shown = 50; updateScanBody(); }

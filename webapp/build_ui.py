@@ -49,7 +49,9 @@ def drop_line(fragment):
 rep("<script>\n/*__LIB__*/\n</script>", '<script src="/lib.js"></script>')
 
 # ---- remove Ask Claude and the shared database
-rep('["journal", "Journal"], ["ask", "Ask Claude"], ["settings", "Settings"]];', '["journal", "Journal"], ["settings", "Settings"]];')
+rep('["journal", "Journal"], ["ask", "Ask Claude"], ["guide", "Guide"], ["settings", "Settings"]];', '["journal", "Journal"], ["guide", "Guide"], ["settings", "Settings"]];')
+rep('["scanner", "Scanner"], ["planner", "Planner"]', '["scanner", "Scanner"], ["movers", "Movers"], ["planner", "Planner"]')
+rep("  var IS_WEB = false;", "  var IS_WEB = true;")
 rep('drawer: null, ctxSym: null, chat: [], chatBusy: false, chatCtl: null, chatNote: "", sampleOK: null',
     'drawer: null, q: {}, qAt: 0, qErr: "", chain: null, chainErr: "", chainBusy: false, scanSt: null')
 rep("var db = null, sample = null, unsubs = [], writeQ = Promise.resolve(), base = null, jcoll = null;", "var db = null, writeQ = Promise.resolve();")
@@ -70,8 +72,8 @@ rep("  function todayStats() {", """  function saveCfg() { lsSet("td.cfg", JSON.
   }
   function todayStats() {""")
 cut("  /* ---------------- Ask Claude ---------------- */", "  /* ---------------- events ---------------- */")
-rep("journal: vJournal, ask: vAsk, settings: vSettings }[S.tab];", "journal: vJournal, settings: vSettings }[S.tab];")
-rep('    if (S.tab === "ask") updateChat();\n    if (S.tab === "news") updateNews();', '    if (S.tab === "news") updateNews();\n    if (S.tab === "options") renderChain();\n    ensureQuotes(false); paintLive();')
+rep("journal: vJournal, ask: vAsk, guide: vGuide, settings: vSettings }[S.tab];", "journal: vJournal, guide: vGuide, movers: vMovers, settings: vSettings }[S.tab];")
+rep('    if (S.tab === "ask") updateChat();\n    if (S.tab === "news") updateNews();', '    if (S.tab === "news") updateNews();\n    if (S.tab === "options") renderChain();\n    ensureQuotes(false); paintLive(); paintMoversCards();\n    if (S.tab === "movers") { updateMovers(); loadMovers(false); }\n    if (S.tab === "news") paintNewsAge();')
 rep("""<button class="btn" data-act="askabout" data-v="' + esc(sym) + '">Ask Claude</button></div>';""", """</div><div id="d-live" class="row" style="margin-top:-4px"></div>';""")
 rep("""<button class=\\"btn sm\\" data-act=\\"askplan\\">Ask Claude to review</button>""", "")
 rep("""    h += '<div class="row" style="margin-top:10px"><button class="btn sm" data-act="askcsp">Ask Claude to critique this put</button></div>';\n""", "")
@@ -103,12 +105,11 @@ rep("""$("#scan-more").innerHTML = rows.length > shown.length ? '<button class="
 rep('th("price", "Price", "r") + th("rsi", "RSI", "r")', 'th("price", "Close", "r hide-s") + \'<th class="r">Live</th>\' + th("rsi", "RSI", "r")')
 rep("""</td><td class="r num">' + r[2].toFixed(2) + '</td><td class="r num">' + r[3].toFixed(0) + '</td><td class="r num hide-s">' + fmtVol(r[4])""",
     """</td><td class="r num hide-s">' + r[2].toFixed(2) + '</td>' + lvCell(r[0]) + '<td class="r num">' + r[3].toFixed(0) + '</td><td class="r num hide-s">' + fmtVol(r[4])""")
-rep("</style>", ".clock { flex-wrap: wrap; justify-content: flex-end; }\n#clock { white-space: nowrap; }\n@media (max-width: 560px) { [data-lv] .small { display: block; } }\n</style>")
+rep("</style>", ".clock { flex-wrap: wrap; justify-content: flex-end; }\n#clock { white-space: nowrap; }\ntd.wrapc, td.wrapc .pill { white-space: normal; }\n@media (max-width: 560px) { [data-lv] .small { display: block; } }\n</style>")
 rep('<tr><td colspan="6" class="empty">', '<tr><td colspan="7" class="empty">')
 rep('<th class="r">Price</th><th class="r">RSI</th><th>Setup</th>', '<th class="r hide-s">Close</th><th class="r">Live</th><th class="r">RSI</th><th class="hide-s">Setup</th>')
 rep("""'</td><td class="r num">' + r[2].toFixed(2) + '</td><td class="r num">' + r[3].toFixed(0) + '</td><td>' + esc(""", """'</td><td class="r num hide-s">' + r[2].toFixed(2) + '</td>' + lvCell(r[0]) + '<td class="r num">' + r[3].toFixed(0) + '</td><td class="hide-s">' + esc(""")
 rep("""(d === null ? "open" : L.money(d))""", """(d === null ? '<span data-unreal="1" data-sym="' + esc(j.sym) + '" data-entry="' + esc(j.entry) + '" data-qty="' + esc(j.qty) + '">open</span>' : L.money(d))""")
-rep("""h += '<p class="foot">Today you have logged '""", """h += '<div id="p-live" class="row" style="margin-top:10px"></div><p class="foot">Today you have logged '""")
 rep("""    h += '<p class="foot">Sizing rule: risk = (strike""", """    h += '<div class="row" style="margin-top:12px"><button class="btn p" data-act="loadchain">Load live put chain</button><span id="c-live" class="row small"></span></div><div id="c-chain"></div>';
     h += '<p class="foot">Sizing rule: risk = (strike""")
 rep("entry: r ? r[2].toFixed(2) : \"\", stopRule: \"pct\"", "entry: S.q[v] && S.q[v].p ? S.q[v].p.toFixed(2) : r ? r[2].toFixed(2) : \"\", auto: true, stopRule: \"pct\"")
@@ -124,6 +125,16 @@ rep("Data is free and delayed (Yahoo, SEC).", "Prices come from Yahoo through th
 # ---- scan button on the Last scan card
 rep("""h += '<div class="row" style="margin-top:10px">' + Object.keys(L.SETUPS)""", """h += '<div class="row" style="margin-top:10px"><button class="btn sm" data-act="runscan">Run scan now</button><span id="scan-st" class="muted small"></span></div><div class="row" style="margin-top:10px">' + Object.keys(L.SETUPS)""")
 
+# ---- Today: after-hours / pre-market movers card
+rep("""h += '<div class="grid g2"><section class="card"><div class="head"><h2>Big movers</h2>""", """h += '<section class="card" id="td-movers"></section>';
+    h += '<div class="grid g2"><section class="card"><div class="head"><h2>Big movers</h2>""")
+# Scanner: look up any stock
+rep("""h += '<div style="margin-top:12px"><div class="scroll"><table id="scan-t">""", """h += '<div class="form" style="margin-top:12px"><label class="f wide">Check any stock: does it match, and if not, why?<span class="row"><input id="lk-sym" placeholder="AMZN" maxlength="8" autocomplete="off" style="max-width:160px"><button class="btn" data-act="lookup">Check</button></span></label></div><div id="lk-out"></div>';
+    h += '<div style="margin-top:12px"><div class="scroll"><table id="scan-t">""")
+# News: refresh controls
+rep("""h += '<div class="form"><label class="f">Ticker<select id="n-t">""", """h += '<div class="row" style="margin-bottom:10px"><button class="btn sm" data-act="refreshnews" id="n-refresh">Refresh news</button><span class="muted small" id="n-age"></span></div>';
+    h += '<div class="form"><label class="f">Ticker<select id="n-t">""")
+
 # ---- new actions and input hooks
 rep("""    if (a === "tab") go(v);
     else if (a === "reload") boot();""", """    if (a === "tab") go(v);
@@ -131,11 +142,15 @@ rep("""    if (a === "tab") go(v);
     else if (a === "refresh") { ensureQuotes(true); refreshMarket(); }
     else if (a === "uselive") { var lq = S.q[v]; if (lq && lq.p) { S.plan.entry = lq.p.toFixed(2); S.plan.example = false; S.plan.auto = true; render(); } }
     else if (a === "usecsp") { var cq = S.q[v]; if (cq && cq.p) { S.csp.price = cq.p.toFixed(2); S.csp.example = false; S.csp.auto = true; render(); } }
-    else if (a === "loadchain") loadChain();
+    else if (a === "loadchain") loadChain("");
+    else if (a === "expiry") loadChain(v);
     else if (a === "pickput") pickPut(+t.getAttribute("data-k"));
+    else if (a === "lookup") lookupStock();
+    else if (a === "refreshnews") refreshNews();
+    else if (a === "mvfilter") { MV.filter = v; updateMovers(); }
     else if (a === "runscan") runScan();""")
 rep("""    if (id.indexOf("p-") === 0) { readPlan(); S.plan.example = false;""", """    if (id.indexOf("p-") === 0) { readPlan(); S.plan.example = false; if (id === "p-entry") S.plan.auto = false; if (id === "p-symbol") { S.plan.auto = true; scheduleLive(); }""")
-rep("""    else if (id.indexOf("c-") === 0) { readCsp(); S.csp.example = false; updateCsp(); }""", """    else if (id === "c-exp") { if (S.chain) { S.chain.exp = +ev.target.value; renderChain(); } }
+rep("""    else if (id.indexOf("c-") === 0) { readCsp(); S.csp.example = false; updateCsp(); }""", """    else if (id === "c-exp") { if (ev.target.value) loadChain(ev.target.value); }
     else if (id.indexOf("c-") === 0) { readCsp(); S.csp.example = false; if (id === "c-price") S.csp.auto = false; if (id === "c-symbol") { S.csp.auto = true; S.chain = null; scheduleLive(); } updateCsp(); }""")
 
 LIVE = r'''
@@ -176,7 +191,7 @@ LIVE = r'''
   function scheduleLive() { clearTimeout(symTimer); symTimer = setTimeout(function () { ensureQuotes(false); }, 500); }
   function lvHtml(q) {
     if (!q || q.err) return '<span class="muted">–</span>';
-    return q.p.toFixed(2) + (isFinite(q.pct) ? ' <span class="' + cls(q.pct) + ' small">' + fmtPct(q.pct) + "</span>" : "");
+    return q.p.toFixed(2) + (q.ses === "post" ? ' <span class="muted small">AH</span>' : q.ses === "pre" ? ' <span class="muted small">PM</span>' : "") + (isFinite(q.pct) ? ' <span class="' + cls(q.pct) + ' small">' + fmtPct(q.pct) + "</span>" : "");
   }
   function quoteTime(q) {
     if (!q || !q.t) return "";
@@ -223,42 +238,160 @@ LIVE = r'''
     } catch (e) { /* keep the last market read */ }
   }
 
-  /* ---------------- put chain ---------------- */
-  async function loadChain() {
+  /* ---------------- put chain: every expiry, from 0 DTE to long-dated ---------------- */
+  var SHORT_BUCKETS = [["0 DTE", 0, 0], ["4-5 DTE", 4, 5], ["7 DTE", 6, 8], ["14 DTE", 12, 16]];
+  async function loadChain(date) {
     var sym = String(S.csp.symbol || "").toUpperCase();
     if (!validSym(sym)) { S.chainErr = "Enter a symbol first."; renderChain(); return; }
     S.chainBusy = true; S.chainErr = ""; renderChain();
     try {
-      var r = await fetch("/api/chain?symbol=" + encodeURIComponent(sym), { cache: "no-store" });
+      var r = await fetch("/api/chain?symbol=" + encodeURIComponent(sym) + (date ? "&date=" + encodeURIComponent(date) : ""), { cache: "no-store" });
       if (!r.ok) throw new Error("http " + r.status);
-      var d = await r.json(); S.chain = { data: d, exp: 0 };
-      if (d.price && S.csp.auto !== false) { S.csp.price = String(d.price); }
+      S.chain = { data: await r.json() };
+      if (date) { S.csp.expiry = date; S.csp.example = false; }
+      if (!(S.q[sym] && S.q[sym].p) && S.chain.data.price) S.csp.price = String(S.chain.data.price);
     } catch (e) { S.chain = null; S.chainErr = "Could not load options for " + sym + ". The symbol may have no options, or the data source is busy."; }
     S.chainBusy = false; if (S.tab === "options") render();
   }
+  function dteChip(label, x, selDate) { return '<button class="chip" data-act="expiry" data-v="' + esc(x.date) + '" aria-pressed="' + (x.date === selDate) + '">' + esc(label) + "</button>"; }
   function renderChain() {
     var el = $("#c-chain"); if (!el) return;
     if (S.chainBusy) { el.innerHTML = '<p class="muted" style="margin-top:10px">Loading the put chain…</p>'; return; }
     if (S.chainErr) { el.innerHTML = '<div class="note bad" style="margin-top:10px">' + esc(S.chainErr) + "</div>"; return; }
     if (!S.chain) { el.innerHTML = ""; return; }
-    var d = S.chain.data;
-    if (!d.expiries.length) { el.innerHTML = '<div class="note" style="margin-top:10px">No expiries 14 to 60 days out for ' + esc(d.symbol) + ".</div>"; return; }
-    var e = d.expiries[Math.min(S.chain.exp, d.expiries.length - 1)];
-    var h = '<label class="f" style="margin-top:12px;max-width:260px">Expiry<select id="c-exp">' + d.expiries.map(function (x, i) { return '<option value="' + i + '"' + (i === S.chain.exp ? " selected" : "") + ">" + esc(fmtDay(x.date)) + " · " + x.dte + " days</option>"; }).join("") + "</select></label>";
+    var d = S.chain.data, all = d.all, sel = d.sel, used = {};
+    var h = '<h3 style="margin-top:14px">Pick an expiry</h3><div class="row" style="margin-top:6px" id="c-short">';
+    SHORT_BUCKETS.forEach(function (b) {
+      var mid = (b[1] + b[2]) / 2, c = all.filter(function (x) { return x.dte >= b[1] && x.dte <= b[2]; }).sort(function (p, q) { return Math.abs(p.dte - mid) - Math.abs(q.dte - mid); })[0];
+      if (c) { used[c.date] = 1; h += dteChip(b[0] + " · " + fmtDay(c.date), c, sel.date); }
+      else h += '<button class="chip" disabled title="This stock has no expiry in that range">' + esc(b[0]) + ": none</button>";
+    });
+    h += "</div>";
+    var std = all.filter(function (x) { return !used[x.date] && x.dte >= 15 && x.dte <= 60; }).slice(0, 6);
+    if (std.length) h += '<p class="muted small" style="margin-top:10px">Standard (15 to 60 days)</p><div class="row" id="c-std">' + std.map(function (x) { return dteChip(x.dte + " DTE · " + fmtDay(x.date), x, sel.date); }).join("") + "</div>";
+    var long = all.filter(function (x) { return x.dte > 60; });
+    if (long.length) h += '<label class="f" style="margin-top:10px;max-width:340px">Long-dated expiries<select id="c-exp"><option value="">Choose…</option>' + long.map(function (x) { return '<option value="' + esc(x.date) + '"' + (x.date === sel.date ? " selected" : "") + ">" + esc(fmtDay(x.date)) + " " + x.date.slice(0, 4) + " · " + x.dte + " days" + (x.dte >= 330 ? " · LEAPS" : "") + "</option>"; }).join("") + "</select></label>";
+    h += '<p style="margin-top:10px"><b>Showing ' + esc(fmtDay(sel.date)) + " " + sel.date.slice(0, 4) + " · " + (sel.dte === 0 ? "0 DTE (expires today)" : sel.dte + " DTE") + "</b></p>";
+    if (sel.dte <= 7) h += '<div class="note" style="margin-top:8px">Short-dated: these move fast and can gap. Prefer only liquid names and small size.</div>';
     if (!d.live_quotes) h += '<div class="note" style="margin-top:10px">These contracts show no bid or ask right now, probably because the market is closed. Strikes and open interest are real, premiums are not. Load the chain again during market hours.</div>';
-    h += '<div class="scroll" style="margin-top:10px"><table><thead><tr><th class="r">Strike</th><th class="r">Bid</th><th class="r">Ask</th><th class="r">Mid</th><th class="r hide-s">Spread</th><th class="r">Open int.</th><th class="r hide-s">IV</th><th></th></tr></thead><tbody>' + e.puts.map(function (r) {
+    h += '<div class="scroll" style="margin-top:10px"><table><thead><tr><th class="r">Strike</th><th class="r">Bid</th><th class="r">Ask</th><th class="r">Mid</th><th class="r hide-s">Spread</th><th class="r">Open int.</th><th class="r hide-s">IV</th><th></th></tr></thead><tbody>' + (sel.puts.length ? sel.puts.map(function (r) {
       var thin = r.oi < 500, wide = r.mid === null || r.spread > 10;
       return '<tr class="clk" tabindex="0" data-act="pickput" data-k="' + r.k + '"><td class="r num">' + r.k.toFixed(2) + '</td><td class="r num">' + r.bid.toFixed(2) + '</td><td class="r num">' + r.ask.toFixed(2) + '</td><td class="r num">' + (r.mid === null ? "–" : r.mid.toFixed(2)) + '</td><td class="r num hide-s">' + (r.spread === null ? "–" : r.spread.toFixed(0) + "%") + '</td><td class="r num">' + r.oi.toLocaleString() + '</td><td class="r num hide-s">' + r.iv.toFixed(0) + '%</td><td>' + (thin ? '<span class="tag">thin</span> ' : "") + (wide ? '<span class="tag">wide</span>' : "") + "</td></tr>";
-    }).join("") + '</tbody></table></div><p class="foot">Tap a strike to fill the calculator with its mid price. "Thin" means open interest under 500, "wide" means a bid-ask gap over 10% of the mid. The skill avoids both.</p>';
+    }).join("") : '<tr><td colspan="8" class="empty">No puts near the price for this expiry.</td></tr>') + '</tbody></table></div><p class="foot">Tap a strike to fill the calculator with its mid price. "Thin" means open interest under 500, "wide" means a bid-ask gap over 10% of the mid. The skill avoids both.</p>';
     el.innerHTML = h;
   }
   function pickPut(k) {
     if (!S.chain) return;
-    var d = S.chain.data, e = d.expiries[Math.min(S.chain.exp, d.expiries.length - 1)], r = e.puts.filter(function (x) { return x.k === k; })[0];
+    var d = S.chain.data, r = d.sel.puts.filter(function (x) { return x.k === k; })[0];
     if (!r) return;
-    S.csp.strike = String(r.k); S.csp.premium = r.mid === null ? "" : String(r.mid); S.csp.expiry = e.date; S.csp.example = false;
+    S.csp.strike = String(r.k); S.csp.premium = r.mid === null ? "" : String(r.mid); S.csp.expiry = d.sel.date; S.csp.example = false;
     if (S.q[d.symbol] && S.q[d.symbol].p) S.csp.price = S.q[d.symbol].p.toFixed(2); else if (d.price) S.csp.price = String(d.price);
     render();
+  }
+
+  /* ---------------- movers: pre-market, after-hours and intraday moves, earnings reactions tagged ---------------- */
+  var MV = { data: null, filter: "all", err: "", busy: false, at: 0 };
+  async function loadMovers(force) {
+    if (MV.busy || (!force && Date.now() - MV.at < 45000)) return;
+    MV.busy = true;
+    try {
+      var r = await fetch("/api/movers", { cache: "no-store" });
+      if (!r.ok) throw new Error("http " + r.status);
+      MV.data = await r.json(); MV.err = ""; MV.at = Date.now();
+      if (MV.data.building) setTimeout(function () { MV.at = 0; loadMovers(true); }, 8000);
+    } catch (e) { MV.err = "Movers are unavailable right now."; }
+    MV.busy = false;
+    if (S.tab === "movers") updateMovers();
+    paintMoversCards();
+  }
+  function earnTagFor(r) {
+    if (!r.e) return "";
+    var d = dayDiff(today(), r.e); if (d < -2 || d > 1) return "";
+    var when = r.ew === "post" ? " · after close" : r.ew === "pre" ? " · before open" : "";
+    return '<span class="pill ' + (d <= 0 ? "warn" : "") + '">Earnings ' + esc(fmtDay(r.e)) + esc(when) + "</span>";
+  }
+  function sesTag(ses) { return ses === "post" ? ' <span class="muted small">AH</span>' : ses === "pre" ? ' <span class="muted small">PM</span>' : ""; }
+  function moverTr(r) {
+    return '<tr class="clk" tabindex="0" data-act="open" data-v="' + esc(r.s) + '"><td class="wrapc"><span class="sym">' + esc(r.s) + "</span>" + earnTagFor(r) + '<span class="nm">' + esc(r.n) + '</span></td><td class="r num hide-s">' + r.close.toFixed(2) + '</td><td class="r num">' + r.p.toFixed(2) + sesTag(r.ses) + '</td><td class="r num ' + cls(r.move) + '">' + fmtPct(r.move) + '</td><td class="r num hide-s">' + fmtVol(r.vol) + "</td></tr>";
+  }
+  function moverRows() {
+    var rows = (MV.data && MV.data.rows) || [];
+    if (MV.filter === "earnings") rows = rows.filter(function (r) { return earnTagFor(r); });
+    else if (MV.filter === "up") rows = rows.filter(function (r) { return r.move > 0; });
+    else if (MV.filter === "down") rows = rows.filter(function (r) { return r.move < 0; });
+    return rows;
+  }
+  function vMovers() {
+    var h = '<section class="card"><div class="head"><h2>Movers</h2><span class="src" id="mv-src"></span></div>';
+    h += '<p class="muted" style="margin-bottom:10px">The biggest moves right now among about 1,500 liquid stocks. Before the open and after the close, <b>Move</b> is the change since the 4pm close, which is where earnings reactions show up. During the day it is the change since yesterday.</p>';
+    h += '<div class="row" id="mv-chips">' + [["all", "All"], ["earnings", "Earnings only"], ["up", "Up"], ["down", "Down"]].map(function (f) { return '<button class="chip" data-act="mvfilter" data-v="' + f[0] + '" aria-pressed="' + (MV.filter === f[0]) + '">' + f[1] + "</button>"; }).join("") + "</div>";
+    h += '<div id="mv-body" style="margin-top:12px"></div></section>';
+    return h;
+  }
+  function updateMovers() {
+    var el = $("#mv-body"); if (!el) return;
+    Array.prototype.forEach.call(document.querySelectorAll("#mv-chips .chip"), function (c) { c.setAttribute("aria-pressed", String(c.getAttribute("data-v") === MV.filter)); });
+    var src = $("#mv-src");
+    if (!MV.data) { el.innerHTML = MV.err ? '<div class="note bad">' + esc(MV.err) + "</div>" : '<p class="muted">Loading movers…</p>'; return; }
+    if (src) src.textContent = "Updated " + ago(MV.data.as_of) + " · " + (MV.data.checked || 0).toLocaleString() + " stocks";
+    if (MV.data.building) { el.innerHTML = '<div class="note info">Building the list of liquid stocks. This happens once a day and takes under a minute.</div>'; return; }
+    var rows = moverRows();
+    el.innerHTML = rows.length ? '<div class="scroll"><table><thead><tr><th>Stock</th><th class="r hide-s">Close</th><th class="r">Now</th><th class="r">Move</th><th class="r hide-s">Volume</th></tr></thead><tbody>' + rows.map(moverTr).join("") + '</tbody></table></div><p class="foot">Tap a row for details and to plan a trade. Pre-market and after-hours prices trade thinly and can jump. Data is delayed.</p>' : '<p class="empty">No stocks match this filter right now.</p>';
+  }
+  function paintMoversCards() {
+    var el = $("#td-movers"); if (!el) return;
+    if (!MV.data) { el.innerHTML = '<div class="head"><h2>After-hours and pre-market movers</h2></div><p class="muted">' + esc(MV.err || "Loading…") + "</p>"; loadMovers(false); return; }
+    var rows = (MV.data.rows || []).slice().sort(function (a, b) { return (earnTagFor(b) ? 1 : 0) - (earnTagFor(a) ? 1 : 0) || Math.abs(b.move) - Math.abs(a.move); }).slice(0, 6);
+    el.innerHTML = '<div class="head"><h2>Earnings reactions and big moves</h2><span class="src">Updated ' + esc(ago(MV.data.as_of)) + '</span></div>' + (MV.data.building ? '<p class="muted">Building the list of liquid stocks…</p>' : rows.length ? '<div class="scroll"><table><thead><tr><th>Stock</th><th class="r hide-s">Close</th><th class="r">Now</th><th class="r">Move</th><th class="r hide-s">Volume</th></tr></thead><tbody>' + rows.map(moverTr).join("") + '</tbody></table></div><p class="foot">These moved after the regular session or early today, so the daily scan cannot see them. <a href="#movers" data-act="tab" data-v="movers">See all movers</a></p>' : '<p class="muted">Nothing is moving more than 2% right now.</p>');
+  }
+
+  /* ---------------- look up any stock ---------------- */
+  async function lookupStock() {
+    var el = $("#lk-out"), sym = N("lk-sym").trim().toUpperCase().replace(/[^A-Z0-9.\-^]/g, "");
+    if (!el) return;
+    if (!validSym(sym)) { el.innerHTML = '<p class="err">Type a stock symbol, for example AMZN.</p>'; return; }
+    el.innerHTML = '<p class="muted">Checking ' + esc(sym) + "…</p>";
+    try {
+      var r = await fetch("/api/lookup?symbol=" + encodeURIComponent(sym), { cache: "no-store" });
+      if (r.status === 404) { el.innerHTML = '<div class="note">No chart data found for ' + esc(sym) + ". Check the symbol.</div>"; return; }
+      if (!r.ok) throw new Error("http " + r.status);
+      var d = await r.json(), n = d.setups.length;
+      var h = '<div class="card flat" style="margin-top:12px"><div class="head"><div><h3 class="mono" style="display:inline">' + esc(d.symbol) + '</h3> <span class="muted">' + esc(d.name) + '</span></div><span class="pill ' + (n ? "good" : "") + '">' + (n ? "Matches " + n + " setup" + (n === 1 ? "" : "s") : "No setup today") + "</span></div>";
+      h += "<p>Close <b>" + d.close.toFixed(2) + "</b> (" + esc(fmtDay(d.as_of)) + ") · RSI " + d.rsi.toFixed(0) + ' · Live <span data-lv="' + esc(d.symbol) + '"></span>' + (d.earn ? " · Earnings " + esc(fmtDay(d.earn)) : "") + "</p>";
+      h += '<ul class="checks">' + d.checks.map(function (c) { return '<li><span class="' + (c.match ? "ok" : "no") + '">' + (c.match ? "✓" : "✕") + "</span><span><b>" + esc(setupName(c.k)) + ".</b> " + esc(c.why) + "</span></li>"; }).join("") + "</ul>";
+      h += '<div class="row" style="margin-top:10px"><button class="btn p sm" data-act="plan" data-v="' + esc(d.symbol) + '">Plan this trade</button><button class="btn sm" data-act="open" data-v="' + esc(d.symbol) + '">Details</button></div>';
+      h += '<p class="foot">The scan only reads regular-session closes. A move after the close, such as an earnings reaction, shows in the <a href="#movers" data-act="tab" data-v="movers">Movers</a> tab instead.</p></div>';
+      el.innerHTML = h; ensureQuotes(false);
+    } catch (e) { el.innerHTML = '<div class="note bad">Could not check ' + esc(sym) + " right now. Try again in a moment.</div>"; }
+  }
+  document.addEventListener("keydown", function (ev) { if (ev.key === "Enter" && ev.target && ev.target.id === "lk-sym") lookupStock(); });
+
+  /* ---------------- news: newest first, refresh on demand ---------------- */
+  function paintNewsAge() {
+    var el = $("#n-age"); if (!el || !S.news) return;
+    el.textContent = "Updated " + (S.news.checked ? ago(S.news.checked) : "just now") + (S.news.refreshing ? " · refreshing…" : "");
+  }
+  async function reloadNews() {
+    try {
+      var r = await fetch("/api/news", { cache: "no-store" }); if (!r.ok) return null;
+      var d = await r.json(); if (!d || !d.items) return null;
+      var changed = !S.news || d.checked !== S.news.checked;
+      S.news = d;
+      if (S.tab === "news" && changed && !isEditing()) updateNews();
+      paintNewsAge(); return d;
+    } catch (e) { return null; }
+  }
+  async function refreshNews() {
+    var b = $("#n-refresh"); if (b) b.disabled = true;
+    var before = S.news && S.news.checked;
+    try { await fetch("/api/news?refresh=1", { cache: "no-store" }); } catch (e) { /* the polling below shows the old news */ }
+    for (var i = 0; i < 12; i++) {
+      await new Promise(function (res) { setTimeout(res, 4000); });
+      var d = await reloadNews();
+      if (d && d.checked !== before && !d.refreshing) break;
+    }
+    var b2 = $("#n-refresh"); if (b2) b2.disabled = false;
+    paintNewsAge();
   }
 
   /* ---------------- scan status ---------------- */
@@ -296,6 +429,8 @@ LIVE = r'''
     ensureQuotes(true);
     setInterval(function () { if (!document.hidden) ensureQuotes(false); }, 15000);
     setInterval(function () { if (!document.hidden) { refreshMarket(); reloadScan(); } }, 60000);
+    setInterval(function () { if (!document.hidden) { if (S.tab === "movers" || S.tab === "today") loadMovers(false); if (S.tab === "news") reloadNews(); } }, 60000);
+    loadMovers(false);
     document.addEventListener("visibilitychange", function () { if (!document.hidden) ensureQuotes(false); });
   }
 

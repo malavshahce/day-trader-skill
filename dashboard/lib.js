@@ -207,17 +207,17 @@
     if (!(px > 0)) return { error: "Enter the stock price." };
     if (!(k > 0)) return { error: "Enter the strike." };
     if (!(prem > 0)) return { error: "Enter the premium you would receive per share." };
-    if (!(dte > 0)) return { error: "Enter days to expiry." };
+    if (!(dte >= 0)) return { error: "Enter days to expiry (0 for a same-day expiry)." };
     if (prem >= k) return { error: "The premium cannot be as large as the strike." };
     var cash = k * 100;
     var credit = prem * 100;
     var breakeven = k - prem;
     var retPct = prem / (k - prem) * 100;           // return on cash actually tied up (strike less premium)
-    var ann = retPct * 365 / dte;
+    var ann = dte > 0 ? retPct * 365 / dte : null;   // a same-day expiry has no meaningful annual rate
     var otm = (px - k) / px * 100;
     var out = {
       cashPerContract: cash, creditPerContract: credit, breakeven: breakeven,
-      returnPct: retPct, annualizedPct: ann, otmPct: otm,
+      returnPct: retPct, annualizedPct: ann, otmPct: otm, dte: dte,
       worstCase: (k - prem) * 100,                  // stock to zero
       loss20: (k - prem) * 100 * 0.20               // options-strategist sizing rule: 20% adverse move
     };
